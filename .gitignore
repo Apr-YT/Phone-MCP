@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# IDE
+.workbuddy/
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Project specific
+phone-mcp/shots/
+phone-mcp/tesseract/
+*.log
+*.stderr.log
+
+# Build artifacts
+phone-mcp/deps/
+phone-mcp/minicap-master/
+phone-mcp/ADBKeyboard.apk
