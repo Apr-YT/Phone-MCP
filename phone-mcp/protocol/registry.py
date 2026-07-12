@@ -20,7 +20,9 @@ from tools.ui import (
     t_input_chinese, t_setup_adbkeyboard,
 )
 from tools.vision import t_find_text, t_tap_text
-from tools.wechat import t_wechat_open_chat, t_send_wechat_message
+from tools.wechat import (t_wechat_open_chat, t_send_wechat_message,
+                           t_wechat_list_contacts, t_wechat_list_chats,
+                           t_wechat_read_messages, t_wechat_search_contact)
 from tools.system import (
     t_shell, t_run_adb, t_list_packages, t_list_processes,
     t_start_service, t_force_stop, t_get_current_app, t_kill_process, t_kill,
@@ -409,6 +411,61 @@ TOOLS = [
             "required": ["contact_name", "message"],
         },
         "handler": t_send_wechat_message,
+    },
+    # ---- 通用微信联系人与消息 ----
+    {
+        "name": "phone_wechat_list_contacts",
+        "description": "列出微信通讯录中的所有联系人。自动切到通讯录 Tab，OCR 识别可见联系人，可选滚动加载更多。返回联系人名称列表。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "maxScrolls": {"type": "integer", "description": "可选，最多滚动次数(默认 5, 最大 20)"},
+                "deviceSerial": {"type": "string", "description": "可选，设备序列号"},
+            },
+        },
+        "handler": t_wechat_list_contacts,
+    },
+    {
+        "name": "phone_wechat_list_chats",
+        "description": "列出微信首页的聊天会话列表（最近联系人）。OCR 识别可见会话，可选滚动加载更多。返回会话名称列表。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "maxScrolls": {"type": "integer", "description": "可选，最多滚动次数(默认 3, 最大 10)"},
+                "minRecent": {"type": "integer", "description": "可选，最少列出数(默认 10)"},
+                "deviceSerial": {"type": "string", "description": "可选，设备序列号"},
+            },
+        },
+        "handler": t_wechat_list_chats,
+    },
+    {
+        "name": "phone_wechat_read_messages",
+        "description": "读取与某联系人的聊天记录。打开聊天后 OCR 识别可见消息，可选向上滚动读取历史消息。contact=联系人名称(必填)。返回消息内容列表。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "contact": {"type": "string", "description": "联系人名称（必填），如 '向远钦' / '文件传输助手'"},
+                "maxScrolls": {"type": "integer", "description": "可选，最大向上滚动次数(默认 5, 最大 20)"},
+                "maxMessages": {"type": "integer", "description": "可选，最多读取条数(默认 50, 最大 200)"},
+                "deviceSerial": {"type": "string", "description": "可选，设备序列号"},
+            },
+            "required": ["contact"],
+        },
+        "handler": t_wechat_read_messages,
+    },
+    {
+        "name": "phone_wechat_search_contact",
+        "description": "在微信中全局搜索联系人（通过首页搜索入口）。输入关键词搜索，返回匹配的联系人列表。可选 openChat=true 自动点击第一个匹配进入聊天。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索关键词（必填），如 '张三' / '文件传输助手'"},
+                "openChat": {"type": "boolean", "description": "可选，是否自动点击第一个匹配进入聊天(默认 false)"},
+                "deviceSerial": {"type": "string", "description": "可选，设备序列号"},
+            },
+            "required": ["query"],
+        },
+        "handler": t_wechat_search_contact,
     },
     # ---- 界面层（写）----
     {

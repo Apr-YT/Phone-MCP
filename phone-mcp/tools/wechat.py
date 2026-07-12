@@ -1,12 +1,37 @@
 # -*- coding: utf-8 -*-
-"""微信集成工具：打开聊天、发送消息。"""
+"""微信集成工具：联系人列表、会话列表、消息读写、搜索、发送。"""
 import os, time, re
 
-from adb import run_adb, log, with_retry, resolve_device
+from adb import run_adb, log, with_retry, with_verification, resolve_device, DRYRUN
 from utils import ok, fail, text_block
-from tools._shared import SHOT_DIR
-from tools.vision import smart_find, _get_ui_xml, _top_pkg, _screen_size
-from tools.ui import t_launch_app
+from tools._shared import SHOT_DIR, _ocr_debug, get_ocr_reader
+from tools.vision import (smart_find, _get_ui_xml, _top_pkg, _screen_size,
+                          ocr_boxes, ocr_match_contact, _ocr_sees, _ocr_tap)
+from tools.ui import (t_launch_app, t_swipe_until_find, t_input_text,
+                      _tap, _u2_device, wechat_tap_input_box,
+                      wechat_clear_input, _input_region_has)
+from tools.system import t_get_current_app
+
+
+def _wechat_foreground(device):
+    """微信是否当前前台 App（dumpsys 解析，无 OCR 开销）。"""
+    return _top_pkg(device) == "com.tencent.mm"
+
+
+def _req(args, key, kind="str"):
+    """取必填参数；缺失或类型不符时抛 ValueError。"""
+    if key not in args or args[key] is None:
+        raise ValueError("缺少必填参数: %s" % key)
+    v = args[key]
+    if kind == "int":
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            raise ValueError("参数 %s 必须为整数，收到: %r" % (key, v))
+    s = str(v)
+    if kind == "str" and not s.strip():
+        raise ValueError("参数 %s 不能为空" % key)
+    return s.strip() if kind == "str" else v
 def t_wechat_open_chat(args):
     """【全链路示例】进入微信某联系人的聊天界面：
        启动微信 → 切到通讯录 → (自动校验)在联系人列表滑动找到并点击该联系人 → 校验进入聊天。
@@ -346,3 +371,243 @@ def t_send_wechat_message(args):
                 contact_name=contact, content=message, sent=False,
                 total_seconds=round(time.time() - clock[0], 1), steps=steps)
 
+
+# ===========================================================================
+# 通用联系人 & 消息工具（不限定特定联系人）
+# ===========================================================================
+
+def t_wechat_list_contacts(args):
+    """列出微信通讯录中的联系人。
+    流程：确保微信在首页 → 切到「通讯录」Tab → OCR 识别可见联系人 → 滚动加载更多。
+    参数：maxScrolls(默认 5, 最多额外滚动次数)。"""
+    device = resolve_device(args.get("deviceSerial"))
+    max_scrolls = min(int(args.get("maxScrolls", 5)), 20)
+    w, h = _screen_size(device)
+
+    steps = []
+    _wechat_ensure_home(device)
+    steps.append("已回到微信主页")
+
+    # 切到通讯录 Tab（微信底部: 「微信」「通讯录」「发现」「我」）
+    for _ in range(2):
+        _tap(int(w * 0.25), int(h * 0.965), device)
+        time.sleep(0.6)
+        if _ocr_sees(device, "通讯录", region=[0, 0.0, 1, 0.10]):
+            break
+
+    if not _ocr_sees(device, "通讯录", region=[0, 0.0, 1, 0.10]):
+        return fail("未能切换到通讯录 Tab（可能微信版本差异）。", steps=steps)
+    steps.append("已切到通讯录 Tab")
+
+    contacts = _ocr_contact_list(device, region=[0, 0.10, 1, 0.90])
+    seen = set(c[0] for c in contacts)
+
+    for i in range(max_scrolls):
+        if len(contacts) >= 200:
+            break
+        run_adb(["shell", "input", "swipe",
+                 str(int(w * 0.5)), str(int(h * 0.75)),
+                 str(int(w * 0.5)), str(int(h * 0.25)),
+                 "200"], device=device, mutating=True)
+        time.sleep(0.6)
+        batch = _ocr_contact_list(device, region=[0, 0.10, 1, 0.90])
+        new_count = 0
+        for name, _, _, _ in batch:
+            if name not in seen:
+                seen.add(name)
+                contacts.append((name, len(contacts) + new_count, 0, 1.0))
+                new_count += 1
+        if new_count == 0:
+            break
+
+    return ok(
+        "通讯录共识别 %d 个联系人（滚动 %d 次）。" % (len(contacts), min(i + 1, max_scrolls)),
+        total=len(contacts),
+        contacts=[{"name": c[0]} for c in contacts],
+        scrolls=min(i + 1, max_scrolls),
+        steps=steps,
+    )
+
+
+def t_wechat_list_chats(args):
+    """列出微信首页的聊天会话列表。
+    参数：maxScrolls(默认 3)、minRecent(默认 10)。"""
+    device = resolve_device(args.get("deviceSerial"))
+    max_scrolls = min(int(args.get("maxScrolls", 3)), 10)
+    min_recent = int(args.get("minRecent", 10))
+    w, h = _screen_size(device)
+
+    steps = []
+    _wechat_ensure_home(device)
+    steps.append("已回到微信主页")
+
+    region = [0, 0.10, 1, 0.88]
+    chats = _ocr_contact_list(device, region=region)
+    seen = set(c[0] for c in chats)
+
+    for i in range(max_scrolls):
+        if len(chats) >= max(min_recent * 3, 60):
+            break
+        run_adb(["shell", "input", "swipe",
+                 str(int(w * 0.5)), str(int(h * 0.80)),
+                 str(int(w * 0.5)), str(int(h * 0.20)),
+                 "200"], device=device, mutating=True)
+        time.sleep(0.5)
+        batch = _ocr_contact_list(device, region=region)
+        new_count = 0
+        for name, _, _, _ in batch:
+            if name not in seen:
+                seen.add(name)
+                chats.append((name, len(chats) + new_count, 0, 1.0))
+                new_count += 1
+        if new_count == 0:
+            break
+
+    return ok(
+        "首页共识别 %d 个聊天会话。" % len(chats),
+        total=len(chats),
+        chats=[{"name": c[0]} for c in chats],
+        scrolls=min(i + 1, max_scrolls),
+        steps=steps,
+    )
+
+
+def t_wechat_read_messages(args):
+    """读取与某联系人的聊天记录。
+    参数：contact(必填)、maxScrolls(默认 5)、maxMessages(默认 50)。"""
+    contact = _req(args, "contact", "str")
+    device = resolve_device(args.get("deviceSerial"))
+    max_scrolls = min(int(args.get("maxScrolls", 5)), 20)
+    max_msgs = min(int(args.get("maxMessages", 50)), 200)
+    w, h = _screen_size(device)
+
+    steps = []
+    open_result = t_wechat_open_chat({
+        "contact": contact, "deviceSerial": device,
+    })
+    if isinstance(open_result, dict) and not open_result.get("success"):
+        return open_result
+    steps.append("已进入与「%s」的聊天" % contact)
+
+    msg_region = [0, 0.08, 1, 0.85]
+    messages = _ocr_message_list(device, region=msg_region)
+    seen = set(m[0] for m in messages)
+
+    for i in range(max_scrolls):
+        if len(messages) >= max_msgs:
+            break
+        run_adb(["shell", "input", "swipe",
+                 str(int(w * 0.5)), str(int(h * 0.55)),
+                 str(int(w * 0.5)), str(int(h * 0.18)),
+                 "300"], device=device, mutating=True)
+        time.sleep(0.8)
+        batch = _ocr_message_list(device, region=msg_region, min_len=4)
+        new_count = 0
+        for text, _, _, _ in batch:
+            if text not in seen:
+                seen.add(text)
+                messages.append((text, len(messages) + new_count, 0, 1.0))
+                new_count += 1
+        if new_count == 0:
+            break
+
+    return ok(
+        "共读取 %d 条消息。" % len(messages),
+        contact=contact,
+        total=len(messages),
+        messages=[{"content": m[0]} for m in messages],
+        scrolls=min(i + 1, max_scrolls),
+        steps=steps,
+    )
+
+
+def t_wechat_search_contact(args):
+    """微信全局搜索联系人（首页搜索入口）。
+    参数：query(必填)、openChat(默认 false)。"""
+    query = _req(args, "query", "str")
+    device = resolve_device(args.get("deviceSerial"))
+    open_chat = bool(args.get("openChat", False))
+    w, h = _screen_size(device)
+
+    steps = []
+    _wechat_ensure_home(device)
+    steps.append("已回到微信主页")
+
+    if not _search_opened(device):
+        _tap(int(w * 0.83), int(h * 0.07), device)
+        time.sleep(0.5)
+    steps.append("已打开搜索框")
+
+    t_input_text({"text": query, "deviceSerial": device, "field": "search"})
+    time.sleep(0.6)
+
+    hits = ocr_match_contact(query, device, region=[0, 0.10, 1, 0.55])
+    if not hits:
+        hits = ocr_match_contact(query, device, region=[0, 0.10, 1, 0.70])
+
+    contacts_found = [
+        {"name": h[0], "cx": h[1], "cy": h[2], "confidence": h[3]}
+        for h in hits[:20]
+    ]
+
+    opened = False
+    if open_chat and hits:
+        lbl, cx, cy, _ = hits[0]
+        _tap(cx, cy, device)
+        time.sleep(0.8)
+        opened = _chat_header_is(device, query)
+
+    return ok(
+        "搜索「%s」找到 %d 个匹配%s。" % (query, len(hits), "，已打开聊天" if opened else ""),
+        query=query, found=len(hits), contacts=contacts_found,
+        opened=opened, steps=steps,
+    )
+
+
+# ===========================================================================
+# 内部辅助：OCR 联系人 / 消息列表
+# ===========================================================================
+
+def _ocr_contact_list(device, region=None, min_len=2, min_conf=0.35):
+    """OCR 识别微信界面中的联系人名称列表。过滤掉系统标签和短文本。"""
+    boxes = ocr_boxes(device, region=region, min_conf=min_conf)
+    SKIP = [
+        "新的朋友", "群聊", "标签", "公众号",
+        "微信", "通讯录", "发现", "我",
+        "搜索", "添加", "企业微信",
+        "服务", "小程序", "视频号", "看一看",
+        "搜一搜", "朋友圈", "收藏", "卡包",
+        "设置", "表情", "拍一拍",
+    ]
+    results = []
+    for text, cx, cy, conf in boxes:
+        text = text.strip()
+        if len(text) < min_len:
+            continue
+        if any(s in text for s in SKIP):
+            continue
+        if re.match(r'^[\d\s\W_]+$', text):
+            continue
+        results.append((text, cx, cy, conf))
+    return results
+
+
+def _ocr_message_list(device, region=None, min_len=2, min_conf=0.30):
+    """OCR 识别微信聊天界面的消息气泡文本。过滤掉时间戳和系统提示。"""
+    boxes = ocr_boxes(device, region=region, min_conf=min_conf)
+    SKIP = [
+        "发送消息", "按住 说话", "发送",
+        "你已添加了", "以上是打招呼",
+        "对方正在输入", "撤回了一条消息",
+    ]
+    results = []
+    for text, cx, cy, conf in boxes:
+        text = text.strip()
+        if len(text) < min_len:
+            continue
+        if any(s in text for s in SKIP):
+            continue
+        if re.match(r'^[\d:/\-\s]+$', text):
+            continue
+        results.append((text, cx, cy, conf))
+    return results
