@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """微信集成工具：联系人列表、会话列表、消息读写、搜索、发送。"""
-import os, time, re
+import os, time, re, json
 
 from adb import run_adb, log, with_retry, with_verification, resolve_device, DRYRUN
 from utils import ok, fail, text_block
@@ -18,6 +18,58 @@ def _wechat_foreground(device):
     return _top_pkg(device) == "com.tencent.mm"
 
 
+# ─────────────────────────────────────────────────────────────
+#  微信发送坐标缓存（秒级响应优化）
+#  首次走完整 OCR 流程时记录：联系人条目坐标 / 发送按钮坐标 / 输入框坐标，
+#  以及记录时的逻辑分辨率(w,h)。后续命中缓存直接用 input tap 点坐标，跳过 OCR，
+#  把单次发送从 16~67s 压到秒级。坐标仅在「分辨率一致 + 微信已前台」时复用，
+#  否则作废回退完整流程，避免界面变化导致点错联系人/按钮。
+# ─────────────────────────────────────────────────────────────
+_WX_COORD_CACHE = None
+_WX_COORD_CACHE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "contact_coords.json")
+
+def _wx_coord_load():
+    global _WX_COORD_CACHE
+    if _WX_COORD_CACHE is not None:
+        return _WX_COORD_CACHE
+    try:
+        with open(_WX_COORD_CACHE_PATH, "r", encoding="utf-8") as f:
+            _WX_COORD_CACHE = json.load(f)
+    except Exception:
+        _WX_COORD_CACHE = {}
+    return _WX_COORD_CACHE
+
+def _wx_coord_save():
+    try:
+        os.makedirs(os.path.dirname(_WX_COORD_CACHE_PATH), exist_ok=True)
+        with open(_WX_COORD_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(_WX_COORD_CACHE, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        _ocr_debug("wx coord cache save 失败: %r" % e)
+
+def _wx_coord_get(contact):
+    return _wx_coord_load().get(contact)
+
+def _wx_coord_put(contact, coords):
+    _wx_coord_load()[contact] = coords
+    _wx_coord_save()
+
+def _wx_coord_invalidate(contact):
+    c = _wx_coord_load()
+    if contact in c:
+        del c[contact]
+        _wx_coord_save()
+
+def _wx_find_coord(device, text, region):
+    """OCR 找一个文字块中心坐标(逻辑分辨率空间)，用于缓存发送按钮等固定控件。"""
+    boxes = ocr_boxes(device, region=region, min_conf=0.2)
+    for b in boxes:
+        if text in b[0]:
+            return [b[1], b[2]]
+    return None
+
+
 def _req(args, key, kind="str"):
     """取必填参数；缺失或类型不符时抛 ValueError。"""
     if key not in args or args[key] is None:
@@ -32,22 +84,66 @@ def _req(args, key, kind="str"):
     if kind == "str" and not s.strip():
         raise ValueError("参数 %s 不能为空" % key)
     return s.strip() if kind == "str" else v
+def _open_chat_by_search(device, contact):
+    """经微信首页搜索打开与 contact 的聊天（已验证可靠路径，send 也走这条）。
+    覆盖「文件传输助手」这类不在通讯录 Tab 的特殊会话。返回 True/False。"""
+    w, h = _screen_size(device)
+    _wechat_ensure_home(device)
+    # 打开搜索框（已处于搜索页则跳过点击）
+    if not _search_opened(device):
+        def open_search():
+            _tap(int(w * 0.83), int(h * 0.07), device)
+            time.sleep(0.2)
+        with_verification(open_search, lambda _: _search_opened(device),
+                          max_retries=3, delay=0.3)
+    # 输入联系人（先聚焦搜索框）
+    def type_contact():
+        _tap(int(w * 0.5), int(h * 0.07), device)
+        time.sleep(0.15)
+        t_input_text({"text": contact, "deviceSerial": device, "field": "search"})
+        time.sleep(0.3)
+    with_verification(type_contact,
+                      lambda _: _ocr_sees(device, contact, region=[0, 0.10, 1, 0.6]),
+                      max_retries=3, delay=0.3)
+    # 点击搜索结果进聊天
+    def click_contact():
+        hits = ocr_match_contact(contact, device, region=[0, 0.12, 1, 0.6])
+        if not hits:
+            return False
+        _, cx, cy, _ = hits[0]
+        _tap(cx, cy, device)
+        time.sleep(0.4)
+        return True
+    def verify_contact():
+        if _chat_header_is(device, contact):
+            return True
+        if _ocr_tap(device, "发消息", region=[0, 0.2, 1, 0.9]):
+            time.sleep(0.5)
+            return _chat_header_is(device, contact)
+        return False
+    return with_verification(click_contact, verify_contact, max_retries=3, delay=0.4)
+
+
 def t_wechat_open_chat(args):
-    """【全链路示例】进入微信某联系人的聊天界面：
-       启动微信 → 切到通讯录 → (自动校验)在联系人列表滑动找到并点击该联系人 → 校验进入聊天。
-    演示'操作后自动校验 + 失败自动重试'的通用闭环思想（基于 with_verification）。
-    微信版本/界面差异可能需微调；手机需已登录微信且联系人存在。"""
+    """进入微信某联系人的聊天界面：搜索优先（覆盖文件传输助手等特殊会话，
+    已自动校验进入聊天），通讯录滑动查找作为兜底。手机需已登录微信且联系人存在。"""
     contact = _req(args, "contact")
     device = resolve_device(args.get("deviceSerial"))
-    pkg = "com.tencent.mm"
     steps = []
     if DRYRUN:
         return ok("[DRYRUN] 将打开微信联系人 '%s' 的聊天。" % contact, dryrun=True, contact=contact)
-    # 1) 启动微信
+    # 1) 搜索优先（send 已验证可靠路径）
+    ok_open = _open_chat_by_search(device, contact)
+    steps.append("搜索打开聊天: %s" % ("成功" if ok_open else "未找到，回退通讯录滑动"))
+    if ok_open:
+        return ok("已打开与 '%s' 的聊天（已自动校验进入聊天界面）。" % contact,
+                  contact=contact, in_chat=True, steps=steps)
+    # 2) 兜底：通讯录列表滑动查找并点击
+    pkg = "com.tencent.mm"
     r = t_launch_app({"package": pkg, "deviceSerial": device})
     steps.append("启动微信: %s" % (r.get("message") if isinstance(r, dict) else r))
     time.sleep(1.5)
-    # 2) 切到通讯录（with_verification：点完校验通讯录标签仍可见）
+
     def _tap_contacts():
         try:
             hits, _ = smart_find("通讯录", device, method="ui")
@@ -70,7 +166,7 @@ def t_wechat_open_chat(args):
                                 max_retries=2, delay=0.8)
     steps.append("切换到通讯录: %s" % ("成功" if ok_c else "未确认(可能已在通讯录)"))
     time.sleep(0.8)
-    # 3) (自动校验+失败重试) 在联系人列表滑动找到并点击联系人，并校验进入聊天
+
     def _open():
         return t_swipe_until_find({"query": contact, "tapOnFind": True,
                                    "maxSwipes": int(args.get("maxSwipes", 12)),
@@ -256,14 +352,17 @@ def _input_via_clipboard(device, text, field):
               text=text, method="clipboard", written=True, verified=verified, field=field)
 
 def t_send_wechat_message(args):
-    """【完整闭环】给微信联系人发消息：启动微信→回主页→打开搜索→输入联系人→
-    精准点击最顶部联系人条目进入聊天→激活输入框→粘贴消息→点发送；每步 OCR 校验、失败重试 2 次。
-    contact_name=联系人名称(备注/昵称)，message=消息内容。需手机已登录微信且该联系人存在。"""
+    """【完整闭环·性能优化版】给微信联系人发消息。
+    优化：① 已在目标聊天 → 跳过启动/搜索/点击联系人(省6-10s)
+          ② 所有 sleep 减半；③ input 广播成功则跳过 OCR 验证
+          ④ 发送前先 BACK 关键盘，再点发送。
+    contact_name=联系人名称(备注/昵称)，message=消息内容。"""
     contact = _req(args, "contact_name", "str")
     message = _req(args, "message", "str")
     device = resolve_device(args.get("deviceSerial"))
     steps = []
     clock = [time.time()]
+    coord_buf = {}  # 本次流程捕获到的坐标，成功时写入缓存
 
     def mark():
         clock.append(time.time())
@@ -272,99 +371,193 @@ def t_send_wechat_message(args):
     if DRYRUN:
         return ok("[DRYRUN] 将给 '%s' 发送: %s" % (contact, message), dryrun=True,
                   contact_name=contact, message=message)
-    # 1) 启动微信并回到主页（带前置判断：已在主页则跳过，省 3~6s）
-    was_home = _wechat_foreground(device) and _ocr_sees(device, "微信", region=[0, 0.0, 1, 0.12])
-    _wechat_ensure_home(device)
-    steps.append("① 启动微信并回到主页%s%s" % ("(已在主页，跳过启动/返回)" if was_home else "", mark()))
+
     w, h = _screen_size(device)
-    # 2) 打开搜索框（前置判断：已处于搜索页则跳过；否则点动作栏搜索图标≈(w*0.83,h*0.07)）
+
+    # ═══ 坐标缓存快路径（秒级响应优化）═══
+    # 命中条件：缓存存在 + 记录分辨率与当前一致 + 微信已在前台(免启动OCR)
+    # 跳过搜索/联系人/发送按钮的 OCR 定位，直接 input tap 缓存坐标。
+    _cache = _wx_coord_get(contact)
+    if (_cache and _cache.get("w") == w and _cache.get("h") == h
+            and _wechat_foreground(device)):
+        _verify = os.environ.get("PHONE_MCP_WX_FAST") != "1"  # 默认做1次末校；=1 乐观免校验
+        steps.append("⚡ 命中坐标缓存，进入快路径(末次OCR校验=%s)%s"
+                     % ("开" if _verify else "关", mark()))
+        # 确保回到微信主页（搜索入口在动作栏）；仅在非主页时做1次OCR判断
+        if not _ocr_sees(device, "微信", region=[0, 0.0, 1, 0.12]):
+            for _ in range(3):
+                run_adb(["shell", "input", "keyevent", "4"], device=device, mutating=True)
+                time.sleep(0.4)
+                if _ocr_sees(device, "微信", region=[0, 0.0, 1, 0.12]):
+                    break
+        _tap(int(w * 0.83), int(h * 0.07), device); time.sleep(0.2)   # 打开搜索
+        _tap(int(w * 0.5), int(h * 0.07), device); time.sleep(0.15)   # 点搜索框
+        t_input_text({"text": contact, "deviceSerial": device, "field": "search"}); time.sleep(0.3)
+        _tap(_cache["contact"][0], _cache["contact"][1], device); time.sleep(0.4)  # 点联系人条目
+        _ix, _iy = _cache.get("input") or [int(w * 0.5), int(h * 0.96)]
+        _tap(_ix, _iy, device); time.sleep(0.2)                        # 激活输入框
+        t_input_text({"text": message, "deviceSerial": device, "field": "chat"}); time.sleep(0.2)
+        _tap(_cache["send"][0], _cache["send"][1], device); time.sleep(0.3)        # 点发送
+        if _verify:
+            _sent = _msg_sent(device, message)
+            if _sent:
+                steps.append("⚡ 快路径发送成功(末次OCR校验通过)%s" % mark())
+                return ok("已给「%s」发送消息：%s" % (contact, message),
+                          contact_name=contact, content=message, sent=True, fast=True,
+                          total_seconds=round(time.time() - clock[0], 1), steps=steps)
+            _wx_coord_invalidate(contact)
+            return fail("快路径发送未通过末次OCR校验（可能微信界面变化），已清除该联系人缓存，请重试。",
+                        contact_name=contact, content=message, sent=False, fast=True,
+                        total_seconds=round(time.time() - clock[0], 1), steps=steps)
+        steps.append("⚡ 快路径发送(乐观免校验)%s" % mark())
+        return ok("已给「%s」发送消息：%s" % (contact, message),
+                  contact_name=contact, content=message, sent=True, fast=True,
+                  total_seconds=round(time.time() - clock[0], 1), steps=steps)
+    # ═══ 以下为原有完整流程（缓存未命中 / 不触发快路径时）═══
+
+    # ═══ 快速短路：已在目标联系人聊天中 → 直接跳到输入+发送 ═══
+    if _wechat_foreground(device):
+        if _chat_header_is(device, contact):
+            steps.append("⏩ 已在「%s」聊天中，跳过启动/搜索/点击" % contact)
+            has_input = _ocr_sees(device, "发送", region=[0, 0.85, 1, 1.0])
+            if not has_input:
+                # 输入框可能未激活
+                _tap(400, int(h * 0.96), device)
+                time.sleep(0.2)
+            # 直接跳到输入+发送
+            inp = {}
+            def type_msg():
+                r = t_input_text({"text": message, "deviceSerial": device, "field": "chat"})
+                inp["msg"] = (r.get("data") or {}).get("method")
+                time.sleep(0.2)
+            ok_m = with_verification(type_msg,
+                                     lambda _: _ocr_sees(device, "发送", region=[0, 0.85, 1, 1.0]),
+                                     max_retries=2, delay=0.3)
+            steps.append("⑥ 输入消息(快速通道): %s%s" % ("成功" if ok_m else "未确认(继续)", mark()))
+            def click_send():
+                if _msg_sent(device, message):
+                    return True
+                run_adb(["shell", "input", "keyevent", "4"], device=device, mutating=True)
+                time.sleep(0.2)
+                return _ocr_tap(device, "发送", region=[0, 0.85, 1, 1.0])
+            ok_send = with_verification(click_send, lambda _: _msg_sent(device, message),
+                                        max_retries=2, delay=0.4)
+            if ok_send:
+                steps.append("⑦ 已发送%s" % mark())
+                return ok("已给「%s」发送消息：%s" % (contact, message),
+                          contact_name=contact, content=message, sent=True,
+                          total_seconds=round(time.time() - clock[0], 1), steps=steps)
+            steps.append("⑦ 发送未确认%s" % mark())
+            return fail("消息已输入但发送未确认。", contact_name=contact, content=message,
+                        sent=False, total_seconds=round(time.time() - clock[0], 1), steps=steps)
+
+        # ═══ 微信已在前台但不在目标聊天 → 只跳到搜索 + 点击 ═══
+        # 回到微信主页
+        was_home = _ocr_sees(device, "微信", region=[0, 0.0, 1, 0.12])
+        if not was_home:
+            _wechat_ensure_home(device)
+            steps.append("① 回到微信主页%s" % mark())
+        else:
+            steps.append("① 已在微信主页%s" % mark())
+    else:
+        # ═══ 微信不在前台 → 完整启动 ═══
+        _wechat_ensure_home(device)
+        steps.append("① 启动微信并回到主页%s" % mark())
+
+    # ═══ 公用：搜索→点击→聊天→输入→发送 ═══
+    w, h = _screen_size(device)
+    # 2) 打开搜索框（前置判断：已处于搜索页则跳过）
     if _search_opened(device):
         steps.append("② 打开搜索框: 已处于搜索页，跳过点击%s" % mark())
     else:
         def open_search():
-            # 真机实测：微信动作栏搜索图标位于 (int(w*0.83), int(h*0.07))≈(996,182)，
-            # 旧坐标 (w*0.91, h*0.03)≈(1092,78) 落在状态栏、点击无效。
             _tap(int(w * 0.83), int(h * 0.07), device)
-            time.sleep(0.4)
-
+            time.sleep(0.2)
         ok_s = with_verification(open_search, lambda _: _search_opened(device),
-                                 max_retries=3, delay=0.6)
+                                 max_retries=3, delay=0.3)
         steps.append("② 打开搜索框: %s%s" % ("成功" if ok_s else "未自动确认(继续)", mark()))
-    # 3) 输入联系人（先点搜索框聚焦，再控件级直写/降级剪贴板粘贴）
+    # 3) 输入联系人（先点搜索框聚焦）
     inp = {}
     def type_contact():
         _tap(int(w * 0.5), int(h * 0.07), device)
-        time.sleep(0.2)
+        time.sleep(0.15)
         r = t_input_text({"text": contact, "deviceSerial": device, "field": "search"})
         inp["contact"] = (r.get("data") or {}).get("method")
-        time.sleep(0.5)
-
+        time.sleep(0.3)
     ok_c = with_verification(type_contact,
                              lambda _: _ocr_sees(device, contact, region=[0, 0.10, 1, 0.6]),
-                             max_retries=3, delay=0.6)
+                             max_retries=3, delay=0.3)
     steps.append("③ 搜索框输入联系人「%s」(输入方式=%s): %s%s"
                  % (contact, inp.get("contact"), "成功" if ok_c else "未确认(继续)", mark()))
-    # 4) 精准点击最顶部联系人条目进入聊天（失败自动重试2次；若停在资料页则点「发消息」）
+    # 4) 点击联系人进聊天
     def click_contact():
         hits = ocr_match_contact(contact, device, region=[0, 0.12, 1, 0.6])
         if not hits:
             return False
         _, cx, cy, _ = hits[0]
+        coord_buf["contact"] = [cx, cy]  # 捕获联系人条目坐标，用于写缓存
         _tap(cx, cy, device)
-        time.sleep(0.8)  # 页面跳转过渡，避免取到过渡画面就误判
+        time.sleep(0.4)
         return True
-
     def verify_contact():
-        # 双条件判定真进聊天：顶部标题=联系人 且 底部出现对话框(发消息/按住说话/发送)
         if _chat_header_is(device, contact):
             return True
-        # 停在资料页：点「发消息」进聊天，再校验双条件
         if _ocr_tap(device, "发消息", region=[0, 0.2, 1, 0.9]):
-            time.sleep(1.0)
+            time.sleep(0.5)
             return _chat_header_is(device, contact)
         return False
-
-    ok_cc = with_verification(click_contact, verify_contact, max_retries=3, delay=0.8)
+    ok_cc = with_verification(click_contact, verify_contact, max_retries=3, delay=0.4)
     if not ok_cc:
         steps.append("④ 点击联系人失败%s" % mark())
         return fail("未能找到/点击联系人 '%s'（可能在搜索结果中未出现，或匹配到聊天记录）。" % contact,
                     contact_name=contact, content=message, steps=steps)
-    steps.append("④ 已进入与「%s」的聊天(双条件校验通过)%s" % (contact, mark()))
-    # 5) 激活输入框（重试2次）
+    steps.append("④ 已进入与「%s」的聊天%s" % (contact, mark()))
+    # 5) 激活输入框
     def focus_input():
         for q in ("发送消息", "按住 说话"):
             if _ocr_tap(device, q, region=[0, 0.85, 1, 1.0]):
                 return True
         _tap(400, int(h * 0.96), device)
         return True
-
     ok_f = with_verification(focus_input,
                              lambda _: _ocr_sees(device, "发送", region=[0, 0.85, 1, 1.0]),
-                             max_retries=3, delay=0.5)
+                             max_retries=2, delay=0.3)
     steps.append("⑤ 激活输入框: %s%s" % ("成功" if ok_f else "未确认(继续)", mark()))
-    # 6) 输入消息（控件级直写/降级剪贴板粘贴，重试2次）
+    # 6) 输入消息
     def type_msg():
         r = t_input_text({"text": message, "deviceSerial": device, "field": "chat"})
         inp["msg"] = (r.get("data") or {}).get("method")
-        time.sleep(0.4)
-
+        # 透传输入校验细节（ADBKeyBoard 焦点/OCR 校验结果），便于排查与训练闭环观测
+        inp["ak"] = (r.get("data") or {}).get("adbkeyboard_info")
+        time.sleep(0.2)
     ok_m = with_verification(type_msg,
-                             lambda _: _ocr_sees(device, message, region=[0, 0.85, 1, 1.0]),
-                             max_retries=3, delay=0.5)
+                             lambda _: _ocr_sees(device, "发送", region=[0, 0.85, 1, 1.0]),
+                             max_retries=2, delay=0.3)
     steps.append("⑥ 输入消息「%s」(输入方式=%s): %s%s"
                  % (message, inp.get("msg"), "成功" if ok_m else "未确认(继续)", mark()))
-    # 7) 点击发送（重试2次；已发出则直接返回，避免重复发送）
+    # 7) 点击发送
     def click_send():
+        # 先捕获发送按钮坐标（无论是否已发送都抓，避免 _msg_sent 误判导致漏抓）
+        _sc = _wx_find_coord(device, "发送", [0, 0.85, 1, 1.0])
+        if _sc:
+            coord_buf["send"] = _sc
         if _msg_sent(device, message):
             return True
+        run_adb(["shell", "input", "keyevent", "4"], device=device, mutating=True)
+        time.sleep(0.2)
         return _ocr_tap(device, "发送", region=[0, 0.85, 1, 1.0])
-
     ok_send = with_verification(click_send, lambda _: _msg_sent(device, message),
-                                max_retries=3, delay=0.8)
+                                max_retries=2, delay=0.4)
     if ok_send:
+        # 写入坐标缓存（下次同联系人直接 input tap，秒级响应）
+        if coord_buf.get("contact") and coord_buf.get("send"):
+            coord_buf["input"] = [int(w * 0.5), int(h * 0.96)]
+            coord_buf["w"], coord_buf["h"] = w, h
+            _wx_coord_put(contact, coord_buf)
         steps.append("⑦ 已发送%s" % mark())
         return ok("已给「%s」发送消息：%s" % (contact, message),
                   contact_name=contact, content=message, sent=True,
+                  adbkeyboard_info=inp.get("ak"),
                   total_seconds=round(time.time() - clock[0], 1), steps=steps)
     steps.append("⑦ 发送未确认%s" % mark())
     return fail("已点击发送但未确认消息「%s」已出现在聊天中（可能发送失败）。" % message,

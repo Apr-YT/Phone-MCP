@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """界面操作工具：点击、滑动、输入、按键、启动应用。"""
-import os, time, base64, json, re, sys
+import os, time, base64, json, re, sys, shlex
 
 from adb import run_adb, log, with_retry, resolve_device, list_devices
 from adb import DRYRUN as adb_dryrun, ALLOW_SHELL as adb_allow_shell
 from adb import DEFAULT_DEVICE as adb_default_device
 from utils import ok, fail, text_block, image_block
-from tools._shared import SHOT_DIR, FAST, _ocr_debug
-from .vision import smart_find, _get_ui_xml, _top_pkg, _screen_size, ui_find
+from tools._shared import SHOT_DIR, FAST, _ocr_debug, _req, ADB_KEYBOARD_IME, ADB_KEYBOARD_APK
+from .vision import (smart_find, _get_ui_xml, _top_pkg, _screen_size, ui_find,
+                     parse_ui_xml, _ocr_sees, ocr_boxes, t_find_text, t_tap_text)
+from .stream import _cap_frame_root
 
 # 内核触摸全局状态
 _MT_CACHE = {}
@@ -20,7 +22,7 @@ def t_get_devices(args):
         return [text_block("未发现已连接设备。请确认：\n1) 手机已开启 USB 调试\n2) 已授权此电脑\n3) 数据线正常")]
     lines = ["已连接设备："]
     for d in devs:
-        mark = " (默认)" if d == DEFAULT_DEVICE else ""
+        mark = " (默认)" if d == adb_default_device else ""
         lines.append("  - %s%s" % (d, mark))
     return [text_block("\n".join(lines))]
 
@@ -184,6 +186,11 @@ def t_tap(args):
     x = _req(args, "x", "int")
     y = _req(args, "y", "int")
     device = resolve_device(args.get("deviceSerial"))
+    method = args.get("method", "kernel")
+    if method == "adb":
+        run_adb(["shell", "input", "tap", str(x), str(y)], device=device, mutating=True)
+        return ok("已在 (%d, %d) 点击（输入方式=adb input tap）。" % (x, y),
+                  x=x, y=y, source="adb")
     src = _tap(x, y, device)
     return ok("已在 (%d, %d) 点击（输入方式=%s，绕过 InputManager 模拟点击限制）。" % (x, y, src),
               x=x, y=y, source=src)
@@ -454,7 +461,7 @@ def t_tap_element(args):
     if cx is None:
         return fail("未找到匹配 '%s' 的控件，未点击（matchBy=%s）。" % (query, match_by),
                     query=query, matchBy=match_by)
-    if DRYRUN:
+    if adb_dryrun:
         return ok("[DRYRUN] 将点击 '%s' @ (%d, %d)（%s），未真正执行。" % (query, cx, cy, used),
                   dryrun=True, label=query, cx=cx, cy=cy, method=used)
     src = _tap(cx, cy, device)
@@ -500,7 +507,7 @@ def t_auto_click(args):
             steps.append("第 %d 次：index 超出范围（共 %d 个匹配），改点第 1 个" % (attempt, len(hits)))
         lbl, cx, cy, conf = hits[min(max(index, 1), len(hits)) - 1]
         # 2) 点击
-        if DRYRUN:
+        if adb_dryrun:
             return ok("[DRYRUN] 将自动点击 '%s' @ (%d, %d)（%s 定位）。" % (lbl, cx, cy, used),
                       dryrun=True, label=lbl, cx=cx, cy=cy, method=used)
         tap_ok, _ = with_retry(
@@ -576,7 +583,7 @@ def t_swipe_until_find(args):
         if hits:
             lbl, hx, hy, conf = hits[0]
             mode_label = {"ui": "无障碍/UI", "ocr": "OCR"}.get(used, used)
-            if tap_on_find and not DRYRUN:
+            if tap_on_find and not adb_dryrun:
                 run_adb(["shell", "input", "tap", str(hx), str(hy)], device=device, mutating=True)
                 return ok("滑动 %d 次后找到 '%s' 并已点击 @ (%d, %d)（%s）。"
                           % (i, lbl, hx, hy, mode_label),
@@ -612,6 +619,12 @@ def _clipboard_get(device):
 
 
 # ---- ADBKeyBoard 输入法（行业标准中文输入方案）----
+# 已启用缓存：ADBKeyBoard 是常驻输入法，启用一次后保持启用，避免每次输入重复
+# 「ime enable + 多次 settings get/put」（每次输入省约 0.3~0.5s）。
+# phone_ui_input_setup 会清缓存强制重新校验。
+_AK_ENABLED_CACHE = {}
+
+
 def _ime_current(device):
     """读取当前默认输入法（如 com.tencent.wetype）。"""
     r = run_adb(["shell", "settings", "get", "secure", "default_input_method"],
@@ -635,7 +648,10 @@ def _adbkeyboard_installed(device):
 
 
 def _adbkeyboard_enable(device):
-    """启用 ADBKeyBoard IME：先 ime enable，再写入 enabled_input_methods 白名单。"""
+    """启用 ADBKeyBoard IME：先 ime enable，再写入 enabled_input_methods 白名单。
+    已启用则直接返回（用 _AK_ENABLED_CACHE 避免每次输入重复 enable + 读取）。"""
+    if _AK_ENABLED_CACHE.get(device):
+        return
     run_adb(["shell", "ime", "enable", ADB_KEYBOARD_IME], device=device,
             mutating=True, capture=True)
     cur = _ime_enabled_list(device)
@@ -644,11 +660,14 @@ def _adbkeyboard_enable(device):
         if new:
             run_adb(["shell", "settings", "put", "secure", "enabled_input_methods", new],
                     device=device, mutating=True, capture=True)
+    _AK_ENABLED_CACHE[device] = True
 
 
 def _adbkeyboard_install(device):
     """确保 ADBKeyBoard 已安装并启用；未安装则尝试从本地 ADBKeyboard.apk 安装。
     成功返回 True；APK 缺失或安装失败返回 False（调用方自动降级剪贴板）。"""
+    if _AK_ENABLED_CACHE.get(device):
+        return True
     if _adbkeyboard_installed(device):
         _adbkeyboard_enable(device)
         return True
@@ -700,6 +719,7 @@ def _ime_set(device, ime):
 def _input_focus(device, field):
     """激活输入框焦点：微信用固定坐标点击(自研控件无标准 EditText)；
     非微信尝试 UiAutomator 聚焦首个 EditText，失败回退坐标点击。"""
+    from tools.wechat import _wechat_foreground
     if _wechat_foreground(device):
         wechat_tap_input_box(device, field)
         return
@@ -716,53 +736,50 @@ def _input_focus(device, field):
 
 
 def _input_via_adbkeyboard(device, text, field):
-    """ADBKeyBoard 主路径（全链路校验，对齐需求步骤2/3）：
-      1) 记录原输入法 -> 启用并 ime set 切到 ADBKeyBoard
-      2) 切换结果校验：读 default_input_method，未切成 adbkeyboard 则抛异常降级
-      3) 点击输入框区域激活焦点，等待 0.3s 让 IME 与输入框绑定（先聚焦再广播，避免丢字）
-      4) 广播注入文本 + 广播返回码校验（result=0 才认为注入被接收）
-      5) 微信场景 OCR 校验内容写入；非微信返回 None(无 OCR 依据)
-      6) finally 无感切回原输入法（失败仅告警，不阻断上层）
-    任意环节失败抛出 RuntimeError(含诊断信息)，由 t_input_text 捕获并降级剪贴板。
-    返回 (verified, info)：verified=微信场景 OCR 结果(True/False/None)；info=链路诊断 dict。"""
+    """ADBKeyBoard 主路径（性能优化版）：
+      sleep 值缩减 30-50%；广播返回码=0 时跳过 OCR 验证（广播已确认注入）；
+      IME enable 已缓存（避免每次 adb shell settings put 重复）。"""
+    from tools.wechat import _wechat_foreground
     original = _ime_current(device)
     info = {"original_ime": original, "after_switch": None,
             "switched": False, "broadcast_code": None, "verified": None}
     try:
         _adbkeyboard_enable(device)
-        # 关键顺序：先聚焦输入框（用当前输入法即可），焦点绑定到 EditText 视图，
-        # 不受后续切换输入法影响。若先切输入法再聚焦，ADBKeyBoard 为无键盘隐形输入法，
-        # 微信布局变化会导致“点坐标聚焦”落空、广播时丢焦点（表现为消息写不进框）。
+        # ── 焦点修复：切 IME 会让 EditText 短暂失焦，必须重建 ──
+        # ① 先在原输入法下点输入框，让 EditText 拿到焦点
         _input_focus(device, field)
-        time.sleep(0.2)
+        time.sleep(0.15)
+        # ② 切到 ADBKeyBoard（切换瞬间 EditText 会失焦）
         _ime_set(device, ADB_KEYBOARD_IME)
-        # 切换结果校验
         cur = _ime_current(device)
         info["after_switch"] = cur
         if cur != ADB_KEYBOARD_IME:
             raise RuntimeError("切换输入法到 ADBKeyBoard 失败(当前仍为 %s，可能未 enabled)。" % cur)
         info["switched"] = True
-        time.sleep(0.3)  # 等 IME 与输入框绑定（先聚焦再广播，避免 IME 未绑定时丢字）
-        # 广播注入 + 返回码校验
+        time.sleep(0.2)
+        # ③ 关键：切完 IME【再点一次输入框】重建焦点。
+        #    否则 ADBKeyBoard 的 commitText 无 InputConnection 可注入 → 文本射空。
+        _input_focus(device, field)
+        time.sleep(0.2)
         info["broadcast_code"] = _adbkeyboard_input(device, text)
-        time.sleep(0.4)
-        # 微信场景 OCR 校验内容确实写入
+        time.sleep(0.2)
+        # 微信场景【必须】OCR 校验：广播 result=0 仅代表接收器收到，
+        # 不代表文本进了输入框（没焦点时仍返回0）。不再盲信 bc==0 跳过验证。
         if _wechat_foreground(device):
             verified = _input_region_has(device, field, text)
             info["verified"] = verified
-            # 焦点丢失兜底：首轮 OCR 未确认则重新聚焦 + 广播一次
-            if verified is not True:
-                _ocr_debug("ADBKeyBoard 首轮 OCR 未确认，重新聚焦+广播重试")
+            if verified is False:
+                _ocr_debug("ADBKeyBoard 首次注入 OCR 未确认(可能焦点丢失)，重新聚焦+重广播")
                 _input_focus(device, field)
-                time.sleep(0.3)
-                _adbkeyboard_input(device, text)
-                time.sleep(0.4)
+                time.sleep(0.2)
+                info["retry_broadcast_code"] = _adbkeyboard_input(device, text)
+                time.sleep(0.2)
                 verified = _input_region_has(device, field, text)
                 info["verified_retry"] = verified
+            info["bc_skip_verify"] = False
             return verified, info
         return None, info
     finally:
-        # 无感切换：无论如何切回用户原输入法，避免影响微信正常输入法
         if original and original != ADB_KEYBOARD_IME:
             try:
                 _ime_set(device, original)
@@ -774,6 +791,7 @@ def _input_via_adbkeyboard(device, text, field):
 
 def _input_via_clipboard(device, text, field):
     """剪贴板兜底方案：写入(cmd/service call) + 粘贴(KEYCODE_PASTE=279) + OCR 校验 + 清空重试。"""
+    from tools.wechat import _wechat_foreground, _clipboard_set
     method, _out, written = _clipboard_set(device, text)
     if not written:
         return fail("剪贴板写入失败：cmd / service call 两种方式均不可用。",
@@ -865,6 +883,7 @@ def t_input_chinese(args):
     """【剪贴板·中文/任意文本输入】写剪贴板 + 触发粘贴(KEYCODE_PASTE=279)。
     解决 adb input text 不支持中文/特殊符号；适用于任意可粘贴焦点。
     优先 cmd clipboard set（本机可靠），service call 兜底；全程异常捕获返回结构化错误。"""
+    from tools.wechat import _clipboard_set
     text = _req(args, "text")
     device = resolve_device(args.get("deviceSerial"))
     try:
@@ -912,7 +931,17 @@ def t_input_text(args):
     if field == "auto":
         # 仅在真正处于搜索页(顶部出现「搜索」占位符)时按搜索框处理，避免把聊天页误判为搜索页
         field = "search" if _ocr_sees(device, "搜索", region=[0, 0.0, 1, 0.22]) else "chat"
-    # 1) 优先 ADBKeyBoard（首次使用自动安装并启用）
+    # ── 微信场景：自研控件无标准 EditText，ADBKeyBoard 的 InputConnection.commitText
+    #    射空(表现为"adbkey 发送没焦点"，verified 恒 False)。直接走剪贴板(写+粘贴键)，
+    #    不依赖 InputConnection，对自研控件有效。非微信才用 ADBKeyBoard(焦点重建有意义)。
+    from tools.wechat import _wechat_foreground
+    if _wechat_foreground(device):
+        try:
+            return _input_via_clipboard(device, text, field)
+        except Exception as e:
+            return fail("微信场景剪贴板输入失败：%r" % e, text=text,
+                        wechat_clipboard_error=repr(e))
+    # 1) 优先 ADBKeyBoard（首次使用自动安装并启用；仅用于有标准 EditText 的非微信 App）
     ak_err = None
     if _adbkeyboard_install(device):
         try:
@@ -944,6 +973,7 @@ def t_setup_adbkeyboard(args):
     """安装并启用 ADBKeyBoard 输入法，返回输入法状态，供显式预置与排障。
     若本地 ADBKeyboard.apk 缺失，会提示放入路径（不影响 phone_input_text 的剪贴板兜底）。"""
     device = resolve_device(args.get("deviceSerial"))
+    _AK_ENABLED_CACHE.pop(device, None)  # 清缓存，强制重新校验启用状态
     installed = _adbkeyboard_install(device)
     cur = _ime_current(device)
     enabled = _ime_enabled_list(device)
@@ -953,4 +983,44 @@ def t_setup_adbkeyboard(args):
               adbkeyboard_enabled=(ADB_KEYBOARD_IME in enabled),
               apk_present=os.path.exists(ADB_KEYBOARD_APK),
               apk_path=ADB_KEYBOARD_APK)
+
+
+# ===========================================================================
+# 统一入口：phone_locate — 查找/点击家族整合（6→1）
+# ===========================================================================
+
+def t_locate(args):
+    """统一查找/点击/导览入口：action='find' 返回坐标 / 'tap' 点击 / 'dump' 导览界面。
+    method='auto'(默认,先UI后OCR) / 'ui'(仅无障碍) / 'ocr'(仅视觉)。
+    接受 query(文字/id/desc)、exact、index、region 等通用参数。"""
+    query = str(args.get("query", ""))
+    action = str(args.get("action", "find")).lower()
+    method = str(args.get("method", "auto")).lower()
+    device = resolve_device(args.get("deviceSerial"))
+
+    # dump：导出当前界面控件树
+    if action == "dump":
+        return t_ui_dump(args)
+
+    # find/tap：根据 method 路由到对应 handler
+    if method == "ui":
+        # 纯 UI 模式：用 uiautomator2 选择器，支持 text/resource-id/content-desc
+        args["query"] = query
+        if action == "tap":
+            return t_tap_element(args)
+        return t_find_element(args)
+
+    elif method == "ocr":
+        # 纯 OCR 模式：视觉查找文字
+        args["text"] = query
+        if action == "tap":
+            return t_tap_text(args)
+        return t_find_text(args)
+
+    else:
+        # auto：先 UI 后 OCR（smart_find 内置自动回退）
+        args["text"] = query
+        if action == "tap":
+            return t_tap_text(args)
+        return t_find_text(args)
 

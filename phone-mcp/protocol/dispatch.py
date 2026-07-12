@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """工具调度层：统一异常捕获 + 信封归一化 + 工具级重试 + 日志。"""
-import json, time, subprocess
+import json, time, subprocess, os
 import sys
 
 from utils import ok, fail, text_block, image_block
 from adb import log
+from protocol.registry import TOOLS
+from tools.learner import recall_text
 
 _TOOL_RETRIES = int(__import__('os').environ.get("PHONE_MCP_TOOL_RETRIES", "2"))
 
@@ -64,6 +66,38 @@ def log_tool(name, args, success, message, dt_ms, attempts=1):
         % (tag, name, arg_s, dt_ms, attempts, (message or "")[:200]))
 
 
+# ---- 经验自动召回（phone-mcp 训练机制的关键闭环）----
+# 原设计靠 LLM 主动调 phone_learn_recall，经常漏调 → 经验白训。
+# 这里在每次工具执行后、结果返回给 LLM 之前，自动用
+#   「工具名 + 入参 + 结果摘要」拼成情境召回相关经验，追加进返回文本。
+# 这样 LLM 在决定下一步操作时，必然能看到匹配经验，训练真正生效。
+_AUTO_RECALL_SKIP = {"phone_learn_recall", "phone_learn_reflect"}  # 跳过自身，防递归/冗余
+_AUTO_RECALL_LIMIT = int(os.environ.get("PHONE_MCP_RECALL_LIMIT", "3"))
+
+
+def _auto_recall(name, arguments, env):
+    """把相关经验追加进 env['message']。纯锦上添花：任何异常都静默跳过。"""
+    try:
+        if os.environ.get("PHONE_MCP_AUTO_RECALL", "1") == "0":
+            return  # 开关关了就不召回（默认开）
+        if name in _AUTO_RECALL_SKIP:
+            return
+        # 构造情境。注意：所有工具名都以 "phone_" 开头，若不去除，
+        # "phone" 这个 token 会零区分度地命中几乎所有经验 → 召回变噪声。
+        raw = "%s %s %s" % (
+            name,
+            json.dumps(arguments or {}, ensure_ascii=False)[:160],
+            (env.get("message") or "")[:200],
+        )
+        situation = raw.replace("phone_", " ")  # 清洗零区分度前缀
+        text = recall_text(situation, limit=_AUTO_RECALL_LIMIT)
+        if text and text != "(无相关经验)":
+            env["message"] = (env.get("message") or "") \
+                + "\n\n【📚 相关经验自动召回】\n" + text
+    except Exception as e:
+        log("[AUTO_RECALL] 跳过(异常): %r" % e)
+
+
 def _env_content(env, image):
     content = [text_block(json.dumps(env, ensure_ascii=False))]
     if image is not None:
@@ -87,6 +121,7 @@ def dispatch_tool(name, arguments, req_id):
             env, image = _normalize_result(res)
             dt = (time.time() - t0) * 1000
             log_tool(name, arguments, env["success"], env["message"], dt, attempts)
+            _auto_recall(name, arguments, env)
             return {"jsonrpc": "2.0", "id": req_id,
                     "result": {"content": _env_content(env, image),
                                "isError": (not env["success"])}}
@@ -97,6 +132,7 @@ def dispatch_tool(name, arguments, req_id):
                 msg = "参数错误: " + msg
             env = fail(msg)
             log_tool(name, arguments, False, env["message"], dt, attempts)
+            _auto_recall(name, arguments, env)
             return {"jsonrpc": "2.0", "id": req_id,
                     "result": {"content": _env_content(env, None), "isError": True}}
         except Exception as e:
@@ -104,11 +140,13 @@ def dispatch_tool(name, arguments, req_id):
             if not _is_transient(e) or attempts >= _TOOL_RETRIES + 1:
                 env = fail("执行失败: %s" % e)
                 log_tool(name, arguments, False, env["message"], dt, attempts)
+                _auto_recall(name, arguments, env)
                 return {"jsonrpc": "2.0", "id": req_id,
                         "result": {"content": _env_content(env, None), "isError": True}}
             log("[RETRY] %s 第 %d/%d 次瞬时异常: %r"
                 % (name, attempts, _TOOL_RETRIES, e))
             time.sleep(0.4)
     env = fail("执行失败: 未知错误")
+    _auto_recall(name, arguments, env)
     return {"jsonrpc": "2.0", "id": req_id,
             "result": {"content": _env_content(env, None), "isError": True}}

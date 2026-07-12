@@ -2,8 +2,32 @@
 """工具模块共享变量（由 server.py 注入配置后生效）。"""
 import os, time
 
-SHOT_DIR = None
+# 默认截图目录（server.py 可在启动后覆盖），避免模块导入时拿到 None
+SHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'shots')
 FAST = False
+
+# ADBKeyBoard IME 标识（用于中文输入注入）
+ADB_KEYBOARD_IME = "com.android.adbkeyboard/.AdbIME"
+
+# ADBKeyBoard 安装包路径（用于 phone_ui_input_setup 自动安装）
+ADB_KEYBOARD_APK = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "ADBKeyboard.apk"
+)
+
+def _req(args, key, kind="str"):
+    """取必填参数；缺失或类型不符时抛 ValueError（由 dispatch 转为参数错误）。"""
+    if key not in args or args[key] is None:
+        raise ValueError("缺少必填参数: %s" % key)
+    v = args[key]
+    if kind == "int":
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            raise ValueError("参数 %s 必须为整数，收到: %r" % (key, v))
+    s = str(v)
+    if kind == "str" and not s.strip():
+        raise ValueError("参数 %s 不能为空" % key)
+    return s.strip() if kind == "str" else v
 
 def _ocr_debug(msg):
     """OCR 诊断日志。"""

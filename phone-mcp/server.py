@@ -68,7 +68,7 @@ _shared_mod.FAST = os.environ.get("PHONE_MCP_FAST") == "1"
 
 # ---- MCP 协议常量 ----
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "phone-mcp", "version": "0.11.0"}
+SERVER_INFO = {"name": "phone-mcp", "version": "0.12.2"}
 
 
 def handle_request(req):
@@ -107,11 +107,8 @@ def main():
     log("phone-mcp v%s 启动, adb=%s, 默认设备=%s, DRYRUN=%s, ALLOW_SHELL=%s"
         % (SERVER_INFO["version"], ADB, DEFAULT_DEVICE, DRYRUN, ALLOW_SHELL))
 
-    # 预加载 OCR
-    try:
-        preview_ocr()
-    except Exception:
-        log("OCR 预加载跳过（未安装或不可用）")
+    # OCR 延迟到首次调用时才加载，避免启动时阻塞 MCP 握手
+    # preview_ocr() 在第一次 tools/call 需要 OCR 时由 get_ocr_reader() 自动触发
 
     for line in sys.stdin:
         line = line.strip()

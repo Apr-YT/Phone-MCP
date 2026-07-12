@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """frida-rust 动态插桩集成。"""
-import os, shlex
+import os, re, shlex
 
 from adb import run_adb, log, resolve_device
 from utils import ok, fail, text_block
-from tools._shared import SHOT_DIR
+from tools._shared import SHOT_DIR, _req
 
 _FRIDA_BIN = "/data/local/tmp/frida-rust"
 
@@ -13,6 +13,40 @@ def _frida_run(device, subcmd, extra_args=None, timeout=60):
     cmd = ["shell", "su", "-c", " ".join(parts)]
     r = run_adb(cmd, device=device, capture=True, timeout=timeout, what="frida-" + subcmd)
     return r.stdout or "", r.stderr or "", r.returncode
+
+
+_SCRIPT_LINE = re.compile(r"\[脚本\]\s*(.*)")
+
+def _extract_script_lines(out):
+    """frida-rust 通过 `[脚本] <内容>` 打印脚本输出，提取每行 `[脚本]` 之后的内容。"""
+    res = []
+    for line in (out or "").splitlines():
+        m = _SCRIPT_LINE.search(line)
+        if m:
+            res.append(m.group(1).strip())
+    return res
+
+def _blob_str_to_hex(out):
+    """从脚本输出中提取首个 Blob.to_string() 结果 [41 42 43]，转成纯 hex 字符串。"""
+    for ln in _extract_script_lines(out):
+        cleaned = re.sub(r"[\s\[\]]+", "", ln)
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _build_blob_script(data_bytes, tail_lines):
+    """生成构造 blob 的 Rhai 脚本：let __b = blob(N); __b[i]=0xNN; ... 后接 tail_lines。
+
+    部署到设备的 frida-rust (v0.1.0, Rhai 1.25.1) 没有全局 blob([...]) 构造器，
+    只能先用 blob(N) 创建定长 blob，再逐字节赋值。
+    """
+    n = len(data_bytes)
+    lines = ["let __b = blob(%d);" % n]
+    for i, b in enumerate(data_bytes):
+        lines.append("__b[%d] = 0x%02x;" % (i, b))
+    lines.extend(tail_lines)
+    return "\n".join(lines)
 
 def t_frida_inject(args):
     """使用 frida-rust 注入共享库到目标进程（ptrace + dlopen）。需 root。"""
@@ -66,7 +100,8 @@ def t_frida_script(args):
     except OSError:
         pass
     if rc == 0:
-        return ok("脚本执行完成", stdout=out.strip(), stderr=err.strip())
+        script_out = "\n".join(_extract_script_lines(out)) or out.strip()
+        return ok("脚本执行完成", stdout=script_out, stderr=err.strip())
     return fail("脚本执行失败 (rc=%d): %s" % (rc, (err or out).strip()))
 
 
@@ -82,7 +117,7 @@ def t_frida_read_mem(args):
     # 用 Rhai 脚本读内存 (确保地址带 0x 前缀)
     if not address.startswith("0x"):
         address = "0x" + address
-    script = 'let data = read_memory(%s, %d); log_info(hex(data));' % (address, size)
+    script = 'let data = read_memory(%s, %d); log_info(data.to_string());' % (address, size)
     local_tmp = os.path.join(SHOT_DIR, "_frida_read.rhai")
     os.makedirs(SHOT_DIR, exist_ok=True)
     with open(local_tmp, "w", encoding="utf-8") as f:
@@ -100,7 +135,7 @@ def t_frida_read_mem(args):
         pass
     if rc == 0:
         return ok("已读取 %d 字节 @ %s (PID=%d)" % (size, address, pid),
-                  hex_data=out.strip())
+                  hex_data=_blob_str_to_hex(out))
     return fail("内存读取失败 (rc=%d): %s" % (rc, (err or out).strip()))
 
 
@@ -114,8 +149,7 @@ def t_frida_write_mem(args):
 
     if not address.startswith("0x"):
         address = "0x" + address
-    script = 'write_memory(%s, blob([%s]));' % (
-        address, ",".join(str(b) for b in data_bytes))
+    script = _build_blob_script(data_bytes, ['write_memory(%s, __b);' % address])
     local_tmp = os.path.join(SHOT_DIR, "_frida_write.rhai")
     os.makedirs(SHOT_DIR, exist_ok=True)
     with open(local_tmp, "w", encoding="utf-8") as f:
@@ -143,8 +177,10 @@ def t_frida_scan_mem(args):
     pattern = _req(args, "pattern")
     data_bytes = bytes.fromhex(pattern.replace(" ", ""))
 
-    script = 'let results = search_bytes(blob([%s])); for addr in results { log_info("0x" + to_string(addr)); }' % (
-        ",".join(str(b) for b in data_bytes))
+    script = _build_blob_script(
+        data_bytes,
+        ['let results = search_bytes(__b);',
+         'for addr in results { log_info("0x" + addr.to_string()); }'])
     local_tmp = os.path.join(SHOT_DIR, "_frida_scan.rhai")
     os.makedirs(SHOT_DIR, exist_ok=True)
     with open(local_tmp, "w", encoding="utf-8") as f:
@@ -161,7 +197,9 @@ def t_frida_scan_mem(args):
     except OSError:
         pass
     if rc == 0:
-        addresses = [l.strip() for l in out.splitlines() if l.strip().startswith("0x")]
+        addresses = []
+        for ln in _extract_script_lines(out):
+            addresses += re.findall(r"0x[0-9a-fA-F]+", ln)
         return ok("找到 %d 个匹配" % len(addresses), addresses=addresses, raw=out.strip())
     return fail("内存扫描失败 (rc=%d): %s" % (rc, (err or out).strip()))
 
@@ -169,8 +207,23 @@ def t_frida_scan_mem(args):
 def t_frida_stealth(args):
     """对目标进程应用 frida-rust 全部反检测措施(TracerPid/maps/特征擦除)。需 root。"""
     device = resolve_device(args.get("deviceSerial"))
+    pid = args.get("pid", 0)
+    # binary 的 script 子命令必须指定脚本文件路径，这里推送一个 no-op 脚本承载 --anti-detect
+    script = 'log_info("stealth-applied");'
+    local_tmp = os.path.join(SHOT_DIR, "_frida_stealth.rhai")
+    os.makedirs(SHOT_DIR, exist_ok=True)
+    with open(local_tmp, "w", encoding="utf-8") as f:
+        f.write(script)
+    device_tmp = "/data/local/tmp/_frida_stealth.rhai"
+    run_adb(["push", local_tmp, device_tmp], device=device, what="frida-push")
+
     out, err, rc = _frida_run(device, "script",
-                               ["--anti-detect", "--pid", str(args.get("pid", 0))])
+                               [device_tmp, "--anti-detect", "--pid", str(pid)])
+    run_adb(["shell", "rm", "-f", device_tmp], device=device, what="frida-cleanup")
+    try:
+        os.remove(local_tmp)
+    except OSError:
+        pass
     if rc == 0:
         return ok("反检测措施已应用", stdout=out.strip())
     return fail("反检测失败 (rc=%d): %s" % (rc, (err or out).strip()))

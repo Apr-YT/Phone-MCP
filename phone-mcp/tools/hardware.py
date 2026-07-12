@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """硬件控制工具：背光、振动、CPU、音频、防火墙。"""
-import os, re
+import os, re, shlex
 
 from adb import run_adb, log, resolve_device, require_shell, with_retry
 from utils import ok, fail, text_block

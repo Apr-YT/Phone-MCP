@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """minicap 等价流式截图子系统（root screencap + 后台持续截帧）。"""
-import os, time, threading, re, base64
+import os, time, threading, re, base64, shlex, collections
 import cv2
 
-from adb import run_adb, log
+from adb import run_adb, log, resolve_device
 from utils import ok, fail, text_block, image_block
-from tools._shared import SHOT_DIR, _ocr_debug, get_ocr_reader
+from tools._shared import SHOT_DIR, _ocr_debug, get_ocr_reader, FAST, _req
 from tools.vision import _screen_size
 def _cap_sync(device):
     """同步设备屏幕参数（minicap banner 等价）：物理分辨率、旋转、刷新率。"""
@@ -136,24 +136,29 @@ def _cap_stream_latest(device):
         return entry["latest"]
 
 
-def _ocr_boxes_from_image(src_path, region=None, min_conf=0.25):
-    """对一张已存在的截图跑 RapidOCR，返回 [(text, cx, cy, conf)]（原图像素坐标）。"""
+def _ocr_boxes_from_image(src_path, region=None, min_conf=0.25, device=None):
+    """对一张已存在的截图跑 RapidOCR，返回 [(text, cx, cy, conf)]。
+
+    坐标为【手机生效逻辑分辨率】空间(=input tap / 内核触摸坐标系)：当传入 device 时，
+    按 _screen_size 把“截图像素”换算到逻辑分辨率，避免 screencap 物理分辨率与触摸
+    坐标系不一致导致点不准。无 device 时退化为原图像素坐标(向后兼容)。
+    """
     import cv2
     img = cv2.imread(src_path)
     if img is None:
         return []
     if img.ndim == 3 and img.shape[2] == 4:
         img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-    h, w = img.shape[:2]
+    h0, w0 = img.shape[:2]
     off_x, off_y = 0, 0
     if region:
         x1, y1, x2, y2 = [float(v) for v in region]
-        cxa, cya = int(x1 * w), int(y1 * h)
-        cxb, cyb = int(x2 * w), int(y2 * h)
+        cxa, cya = int(x1 * w0), int(y1 * h0)
+        cxb, cyb = int(x2 * w0), int(y2 * h0)
         if cxb > cxa and cyb > cya:
             img = img[cya:cyb, cxa:cxb]
             off_x, off_y = cxa, cya
-            h, w = img.shape[:2]
+    h, w = img.shape[:2]
     max_side = 720 if FAST else 1080
     scale = 1.0
     if max(h, w) > max_side:
@@ -161,6 +166,13 @@ def _ocr_boxes_from_image(src_path, region=None, min_conf=0.25):
         img = cv2.resize(img, (int(w * scale), int(h * scale)))
     tmp = src_path + ".ocr.png"
     cv2.imwrite(tmp, img)
+    sx = sy = 1.0
+    if device:
+        try:
+            sw, sh = _screen_size(device)
+            sx, sy = float(sw) / w0, float(sh) / h0
+        except Exception:
+            pass
     try:
         result, _ = get_ocr_reader()(tmp)
     except Exception as e:
@@ -178,8 +190,10 @@ def _ocr_boxes_from_image(src_path, region=None, min_conf=0.25):
             continue
         xs = [p[0] for p in bbox]
         ys = [p[1] for p in bbox]
-        cx = int((min(xs) + max(xs)) / 2 / scale) + off_x
-        cy = int((min(ys) + max(ys)) / 2 / scale) + off_y
+        cx_img = (min(xs) + max(xs)) / 2 / scale + off_x
+        cy_img = (min(ys) + max(ys)) / 2 / scale + off_y
+        cx = int(round(cx_img * sx))
+        cy = int(round(cy_img * sy))
         boxes.append((txt, cx, cy, conf))
     return boxes
 
@@ -250,7 +264,7 @@ def t_ocr_stream(args):
         except Exception as e:
             return fail("截图失败: %s" % e)
         src = dest
-    boxes = _ocr_boxes_from_image(src, region=region, min_conf=min_conf)
+    boxes = _ocr_boxes_from_image(src, region=region, min_conf=min_conf, device=device)
     if query:
         if exact:
             hits = [b for b in boxes if b[0].strip() == query]

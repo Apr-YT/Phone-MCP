@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """视觉定位层：UI XML 解析 + RapidOCR + 智能路由(smart_find)。"""
 import os, re, time, threading, json, base64
+import numpy as np
 import xml.etree.ElementTree as ET
 import subprocess
+import traceback
 
-from adb import run_adb, log, with_retry
+from adb import run_adb, log, with_retry, DRYRUN, resolve_device
 from utils import ok, fail, text_block, image_block
 from tools._shared import SHOT_DIR, FAST, _ocr_debug, get_ocr_reader
 
@@ -19,26 +21,52 @@ _UI_EMPTY_TTL = 30
 _TOP_PKG_RE = _TOP_PKG_RE = re.compile(r"mCurrentFocus=Window\{[^}]*?\s([\w.]+)/")
 
 def _get_ui_xml(device):
-    """dump 当前界面 UI 结构并拉取到本地，返回 XML 文本；失败返回 None（带超时+重试）。"""
+    """dump 当前界面 UI 结构并返回 XML 文本；失败返回 None。
+
+    性能优化：优先用 `adb exec-out uiautomator dump /dev/tty` 一次流式返回，
+    省去旧方案「写设备文件(/sdcard/ui_dump.xml) + pull 回本地」两步 adb 往返
+    （每次点击/定位约省 0.5~1s）。仅当流式方案失败或无有效节点时回退旧方案，保证兼容。"""
     try:
-        run_adb(["shell", "uiautomator", "dump", "/sdcard/ui_dump.xml"],
-                device=device, mutating=False, what="uiautomator dump")
+        r = run_adb(["exec-out", "uiautomator", "dump", "/dev/tty"],
+                    device=device, mutating=False, capture=True, binary=True,
+                    what="uiautomator dump(stream)")
+        out = r.stdout or b""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "ignore")
     except Exception as e:
-        log("uiautomator dump 失败:", e)
-        return None
-    os.makedirs(SHOT_DIR, exist_ok=True)
-    local = os.path.join(SHOT_DIR, "ui_dump.xml")
-    try:
-        run_adb(["pull", "/sdcard/ui_dump.xml", local], device=device, mutating=False, what="pull ui_dump")
-    except Exception as e:
-        log("pull ui_dump 失败:", e)
-        return None
-    try:
-        with open(local, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
-    except Exception as e:
-        log("读取 UI dump 失败:", e)
-        return None
+        log("uiautomator dump(stream) 失败，回退旧方案:", e)
+        out = None
+    if not out or "<node" not in out:
+        # 回退：写设备文件 + pull（最稳妥的兜底路径）
+        try:
+            run_adb(["shell", "uiautomator", "dump", "/sdcard/ui_dump.xml"],
+                    device=device, mutating=False, what="uiautomator dump")
+        except Exception as e:
+            log("uiautomator dump 失败:", e)
+            return None
+        os.makedirs(SHOT_DIR, exist_ok=True)
+        local = os.path.join(SHOT_DIR, "ui_dump.xml")
+        try:
+            run_adb(["pull", "/sdcard/ui_dump.xml", local], device=device, mutating=False, what="pull ui_dump")
+        except Exception as e:
+            log("pull ui_dump 失败:", e)
+            return None
+        try:
+            with open(local, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except Exception as e:
+            log("读取 UI dump 失败:", e)
+            return None
+    # 去掉 uiautomator 可能附加的提示行，仅保留 XML
+    s = out.find("<?xml")
+    if s < 0:
+        s = out.find("<hierarchy")
+    if s < 0:
+        s = out.find("<node")
+    e = out.rfind(">")
+    if s >= 0 and e >= 0:
+        out = out[s:e + 1]
+    return out
 
 def ui_find(query, xml, exact=False):
     """从 uiautomator XML 中查找 text / content-desc 含 query 的控件。
@@ -90,11 +118,11 @@ def _ui_is_empty(xml):
 
 def _ocr_only(query, device, exact, region):
     get_ocr_reader()
-    shot = _ocr_screenshot(device, region)
+    shot = _ocr_screenshot_img(device, region)
     if not shot:
         raise RuntimeError("截图失败，无法 OCR。")
-    path, scale, off_x, off_y = shot
-    return ocr_find(query, path, scale, off_x=off_x, off_y=off_y, exact=exact)
+    img, scale, off_x, off_y, coord_scale = shot
+    return ocr_find(query, img, scale, off_x=off_x, off_y=off_y, coord_scale=coord_scale, exact=exact)
 
 def smart_find(query, device, exact=False, region=None, method="auto"):
     """统一查找入口，返回 (hits, used_method)。
@@ -212,12 +240,18 @@ def _get_ocr_reader_local():
     from tools._shared import get_ocr_reader
     return get_ocr_reader()
 
-def _ocr_screenshot(device, region=None):
-    """截图到 OCR 专用文件。
+def _ocr_screenshot_img(device, region=None):
+    """截图并返回内存中的 numpy 图像(已降采样到 OCR 目标分辨率)，零磁盘 IO。
 
-    region: 可选 [x1,y1,x2,y2] 归一化(0~1)区域，只识别该区域以大幅提速。
-    返回 (path, scale, off_x, off_y)：scale 为缩放比，off_* 为裁剪区在全图的左上角(原图像素)。
+    返回 (img, scale, off_x, off_y, coord_scale)：
+      - img        : BGR numpy 数组，直接喂 RapidOCR（不再写盘→读盘）
+      - scale      : 降采样缩放比, 1.0 表示未缩放
+      - off_x/off_y: 裁剪区在全图(截图原始像素)的左上角
+      - coord_scale: (sx, sy) 把【截图像素】映射到【手机生效逻辑分辨率】的缩放因子；
+                     OCR 最终坐标须乘此因子才能与 input tap / 内核触摸坐标系对齐。
     不做坐标记忆——每次都实时截图+实时OCR，界面动态也不怕点错。
+    性能：cv2.imdecode 直接从 screencap 字节解码，省「写原图+读原图」两次磁盘 IO；
+          降采样在内存完成，最终直接把 numpy 交给 RapidOCR，再省「写小图+读小图」两次 IO。
     """
     import cv2
     try:
@@ -229,45 +263,67 @@ def _ocr_screenshot(device, region=None):
     png = ok.stdout
     if not png or len(png) < 100:
         return None
-    os.makedirs(SHOT_DIR, exist_ok=True)
-    path = os.path.join(SHOT_DIR, "ocr_shot.png")
-    with open(path, "wb") as f:
-        f.write(png)
-    img = cv2.imread(path)
+    img = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
-        _ocr_debug("截图 cv2.imread 失败 path=%s" % path)
+        _ocr_debug("截图 cv2.imdecode 失败")
         return None
-    if img.ndim == 3 and img.shape[2] == 4:
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-        cv2.imwrite(path, img)
-    h, w = img.shape[:2]
+    shot_h, shot_w = img.shape[:2]
     off_x, off_y = 0, 0
     if region:
         x1, y1, x2, y2 = [float(v) for v in region]
-        cxa, cya = int(x1 * w), int(y1 * h)
-        cxb, cyb = int(x2 * w), int(y2 * h)
+        cxa, cya = int(x1 * shot_w), int(y1 * shot_h)
+        cxb, cyb = int(x2 * shot_w), int(y2 * shot_h)
         if cxb > cxa and cyb > cya:
             img = img[cya:cyb, cxa:cxb]
             off_x, off_y = cxa, cya
-            cv2.imwrite(path, img)
-            h, w = img.shape[:2]
-    # 极速模式用 720 长边(更快但精度略降)；默认 1080(精度更稳)。
-    max_side = 720 if FAST else 1080
+    # 降采样提速：默认 720 长边（推理耗时较 1080 约减半，中文 UI 精度足够）；
+    # FAST 模式进一步降到 640。coord_scale 用降采样前的原始截图尺寸(shot_w/h)。
+    max_side = 640 if FAST else 720
     scale = 1.0
-    if max(h, w) > max_side:
-        scale = max_side / max(h, w)
-        small = cv2.resize(img, (int(w * scale), int(h * scale)))
-        cv2.imwrite(path, small)
-    _ocr_debug("截图 OK path=%s size=%dx%d scale=%.3f" % (path, w, h, scale))
-    return path, scale, off_x, off_y
-def ocr_find(query, image_path, scale, off_x=0, off_y=0, exact=False, min_conf=0.25):
-    """在截图中查找包含 query 的文字块，返回 [(text, cx, cy, conf)]（原图像素坐标）。"""
+    if max(img.shape[0], img.shape[1]) > max_side:
+        scale = max_side / max(img.shape[0], img.shape[1])
+        img = cv2.resize(img, (int(img.shape[1] * scale), int(img.shape[0] * scale)))
+    sw, sh = _screen_size(device)
+    coord_scale = (float(sw) / shot_w, float(sh) / shot_h)
+    _ocr_debug("截图 OK img=%dx%d scale=%.3f 逻辑=%dx%d coord_scale=(%.3f,%.3f)"
+               % (shot_w, shot_h, scale, sw, sh, coord_scale[0], coord_scale[1]))
+    return img, scale, off_x, off_y, coord_scale
+
+def _ocr_screenshot(device, region=None):
+    """兼容包装：返回 (path, scale, off_x, off_y, coord_scale)（写盘一次供外部调试脚本用）。
+    内部已优化为内存解码 + 内存降采样；此处仅最后写一次盘以兼容旧调用方(diag/verify等)。"""
+    res = _ocr_screenshot_img(device, region)
+    if not res:
+        return None
+    img, scale, off_x, off_y, coord_scale = res
+    import cv2
+    os.makedirs(SHOT_DIR, exist_ok=True)
+    path = os.path.join(SHOT_DIR, "ocr_shot.png")
+    cv2.imwrite(path, img)
+    return path, scale, off_x, off_y, coord_scale
+def ocr_find(query, image, scale, off_x=0, off_y=0, coord_scale=(1.0, 1.0),
+             exact=False, min_conf=0.25):
+    """在截图中查找包含 query 的文字块，返回 [(text, cx, cy, conf)]。
+
+    坐标为【手机生效逻辑分辨率】空间(=input tap / 内核触摸坐标系)，已由 coord_scale
+    把 OCR 原始“截图像素”换算到位；coord_scale 默认 (1.0,1.0) 表示截图分辨率即逻辑分辨率。
+    image 可为 numpy(BGR) 数组（推荐，零 IO）或图像路径（兼容旧调用）。
+    """
+    import cv2
+    if isinstance(image, str):
+        img = cv2.imread(image)
+        if img is None:
+            _ocr_debug("ocr_find: imread 失败 path=%s" % image)
+            return []
+    else:
+        img = image
+    sx, sy = coord_scale
     reader = get_ocr_reader()
     result = None
     last_err = None
     for _attempt in range(2):
         try:
-            result, _ = reader(image_path)   # RapidOCR: list of [bbox, text, score]
+            result, _ = reader(img)   # RapidOCR 接受 numpy(BGR) 或路径
             break
         except Exception as e:
             last_err = e
@@ -291,22 +347,29 @@ def ocr_find(query, image_path, scale, off_x=0, off_y=0, exact=False, min_conf=0
         if match:
             xs = [p[0] for p in bbox]
             ys = [p[1] for p in bbox]
-            cx = int((min(xs) + max(xs)) / 2 / scale) + off_x
-            cy = int((min(ys) + max(ys)) / 2 / scale) + off_y
+            # 1) OCR 框中心(降采样空间) → 截图原始像素；2) 加裁剪偏移；3) 映射至逻辑分辨率
+            cx_img = (min(xs) + max(xs)) / 2 / scale + off_x
+            cy_img = (min(ys) + max(ys)) / 2 / scale + off_y
+            cx = int(round(cx_img * sx))
+            cy = int(round(cy_img * sy))
             hits.append((txt, cx, cy, conf))
     if not hits:
         _ocr_debug("ocr_find: 无匹配 query=%r 总数=%d 样例=%s" % (
             query, len(result), [(t, round(float(c), 2)) for _, t, c in result[:15]]))
     return hits
 def ocr_boxes(device, region=None, min_conf=0.25):
-    """全屏(或 region 归一化区域)OCR，返回 [(text, cx, cy, conf)]（原图像素坐标）。
+    """全屏(或 region 归一化区域)OCR，返回 [(text, cx, cy, conf)]。
+
+    坐标为【手机生效逻辑分辨率】空间(=input tap / 内核触摸坐标系)，已通过
+    _ocr_screenshot 的 coord_scale 把 OCR 原始截图像素换算到位。
     region: 可选 [x1,y1,x2,y2] 归一化(0~1)区域，只识别该区域以提速并避免误匹配。"""
-    shot = _ocr_screenshot(device, region)
+    shot = _ocr_screenshot_img(device, region)
     if not shot:
         return []
-    path, scale, off_x, off_y = shot
+    img, scale, off_x, off_y, coord_scale = shot
+    sx, sy = coord_scale
     try:
-        result, _ = get_ocr_reader()(path)
+        result, _ = get_ocr_reader()(img)
     except Exception as e:  # noqa: BLE001
         _ocr_debug("ocr_boxes reader 异常: %r" % e)
         return []
@@ -322,8 +385,10 @@ def ocr_boxes(device, region=None, min_conf=0.25):
             continue
         xs = [p[0] for p in bbox]
         ys = [p[1] for p in bbox]
-        cx = int((min(xs) + max(xs)) / 2 / scale) + off_x
-        cy = int((min(ys) + max(ys)) / 2 / scale) + off_y
+        cx_img = (min(xs) + max(xs)) / 2 / scale + off_x
+        cy_img = (min(ys) + max(ys)) / 2 / scale + off_y
+        cx = int(round(cx_img * sx))
+        cy = int(round(cy_img * sy))
         boxes.append((txt, cx, cy, conf))
     return boxes
 
@@ -359,13 +424,32 @@ def _ocr_tap(device, query, region=None, min_conf=0.25, strategy="top"):
     run_adb(["shell", "input", "tap", str(cx), str(cy)], device=device, mutating=True)
     return True
 
+_SCREEN_SIZE_CACHE = {}
+
 def _screen_size(device):
-    """取屏幕像素尺寸 (w, h)；失败回退 1080x2340。"""
+    """取【当前生效的逻辑显示分辨率】(w, h)，即 input tap / 内核触摸 / UI 坐标系所用的空间。
+
+    关键修正：wm size 可能同时存在 Physical size 与 Override size。screencap 始终按
+    Physical(物理面板)分辨率出图，而 input tap 等触摸注入按【Override(生效逻辑)】
+    分辨率工作。两者不一致(用户改过“显示大小”或 wm size override)时，OCR 坐标若
+    直接用 screencap 像素会整体偏移 → 点不准。这里统一返回生效逻辑分辨率作为所有
+    点击/坐标的参考系，配合 _ocr_screenshot 的 coord_scale 把 OCR 坐标换算到该空间。
+
+    带缓存，避免每次 adb wm size；失败回退 1080x2340。
+    """
+    if device in _SCREEN_SIZE_CACHE:
+        return _SCREEN_SIZE_CACHE[device]
     try:
         r = run_adb(["shell", "wm", "size"], device=device, mutating=False, what="wm size")
-        m = re.search(r"(\d+)x(\d+)", r.stdout or "")
+        txt = r.stdout or ""
+        # 优先 Override(生效逻辑分辨率)，其次 Physical
+        m = re.search(r"Override size:\s*(\d+)x(\d+)", txt)
+        if not m:
+            m = re.search(r"Physical size:\s*(\d+)x(\d+)", txt)
         if m:
-            return int(m.group(1)), int(m.group(2))
+            sz = (int(m.group(1)), int(m.group(2)))
+            _SCREEN_SIZE_CACHE[device] = sz
+            return sz
     except Exception:
         pass
     return 1080, 2340

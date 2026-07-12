@@ -33,3 +33,21 @@ phone-mcp/minicap-master/
 phone-mcp/ADBKeyboard.apk
 _old_server.py
 _wechat_new.py
+
+# Training & dev temp artifacts (do not commit)
+*.bak
+phone-mcp/test_*.py
+phone-mcp/verify_*.py
+phone-mcp/selftest.py
+phone-mcp/perf_test.py
+phone-mcp/monitor.py
+phone-mcp/PERF_REPORT.md
+phone-mcp/TEST_REPORT.md
+phone-mcp/monitor_log.md
+phone-mcp/perf_report.*
+phone-mcp/selftest_report.*
+phone-mcp/report_gen.js
+phone-mcp/perf_out.json
+phone-mcp/app_perf.json
+phone-mcp/diag_ocr.py
+phone-mcp/open_chat_explore.py

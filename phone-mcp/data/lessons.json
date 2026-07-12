@@ -1,0 +1,1042 @@
+{
+  "version": 1,
+  "updated": "2026-07-12T06:31:45Z",
+  "lessons": [
+    {
+      "id": "frida-noexec-remount",
+      "title": "部署二进制到 /data/local/tmp 需先 remount exec",
+      "principle": "/data/local/tmp 是 tmpfs noexec，部署二进制前先 mount -o remount,exec",
+      "why": "Android 对该 tmpfs 默认加 noexec；root 也改不了 DAC 写 /data/local 与 /data/adb，只有 tmp 可写且 remount 后可 exec。",
+      "triggers": [
+        "frida",
+        "binary",
+        "deploy",
+        "push",
+        "/data/local/tmp",
+        "exec",
+        "remount",
+        "noexec",
+        "permission denied",
+        "rc=126"
+      ],
+      "evidence": [
+        "部署 frida-rust 时 rc=126，remount exec 后 --version rc=0",
+        "第二轮部署 frida-rust 仍先 remount 才成功"
+      ],
+      "applies_to": [
+        "frida",
+        "deploy"
+      ],
+      "confidence": 1,
+      "created": "2026-07-12T00:00:00Z",
+      "last_verified": "2026-07-12T03:49:22Z",
+      "hits": 2,
+      "stale": false
+    },
+    {
+      "id": "wx-send-button-kernel-touch",
+      "title": "微信发送按钮不响应 kernel touch",
+      "principle": "微信发送按钮对 kernel 层 touch 无响应，必须用 `adb shell input tap x y`（或 phone_ui_tap(method=adb)）触发；phone_ui_tap 默认的 kernel 注入点不动它。",
+      "why": "微信发送按钮的事件处理在应用层，绕过了注入的 kernel 事件。",
+      "triggers": [
+        "wechat",
+        "wx",
+        "发送",
+        "send",
+        "tap",
+        "button",
+        "kernel",
+        "input tap",
+        "微信"
+      ],
+      "evidence": [
+        "用内核注入点发送无反应，改用 adb input tap 才发出"
+      ],
+      "applies_to": [
+        "wechat",
+        "ui"
+      ],
+      "confidence": 0.9,
+      "created": "2026-07-12T00:00:00Z",
+      "last_verified": "2026-07-12T00:00:00Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "adbkeyboard-ime-intercept",
+      "title": "键盘拉起时 adb input tap 被 IME 拦截",
+      "principle": "当 ADBKeyBoard 输入法已拉起，直接 `adb input tap` 会被输入法拦截；正确顺序是先 `input keyevent BACK` 收起键盘，再点发送/目标。",
+      "why": "ADBKeyBoard 在前台时消费了坐标点击。",
+      "triggers": [
+        "adbkeyboard",
+        "ime",
+        "input tap",
+        "keyboard",
+        "back",
+        "拦截",
+        "输入法"
+      ],
+      "evidence": [
+        "键盘态下点发送被吞，BACK 后再点成功"
+      ],
+      "applies_to": [
+        "input",
+        "wechat",
+        "ui"
+      ],
+      "confidence": 0.85,
+      "created": "2026-07-12T00:00:00Z",
+      "last_verified": "2026-07-12T00:00:00Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "frida-rhai-no-global-blob-hex",
+      "title": "frida-rust v0.1.0 的 Rhai 无全局 blob()/hex()",
+      "principle": "部署的 frida-rust 二进制(v0.1.0, Rhai 1.25.1)没有全局 `blob([...])`/`Blob([...])` 构造器和 `hex()`；构造字节用 `let b=blob(N); b[i]=0xNN;`，输出用 `data.to_string()`(得 [414243]) 或 `.to_hex()`，`log_info` 只收字符串。",
+      "why": "这些 API 是后续版本才加的；v0.1.0 只注册了 read_memory/write_memory/search_bytes 等函数式 API。",
+      "triggers": [
+        "frida",
+        "rhai",
+        "script",
+        "blob",
+        "hex",
+        "to_string",
+        "write_memory",
+        "read_memory",
+        "search_bytes",
+        "脚本"
+      ],
+      "evidence": [
+        "probe 实测 blob()/Blob()/hex() 全部报错；blob(N)+索引赋值可行"
+      ],
+      "applies_to": [
+        "frida"
+      ],
+      "confidence": 0.95,
+      "created": "2026-07-12T00:00:00Z",
+      "last_verified": "2026-07-12T00:00:00Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "frida-stealth-libc-so-android",
+      "title": "frida-rust stealth 在 Android 上 rc=1 (libc.so.6 缺陷)",
+      "principle": "phone_frida_stealth 在 Android 上返回 rc=1 不是脚本问题：二进制 --anti-detect 的 maps_hide 试图 GOT-hook `libc.so.6`(glibc 名)，但 Android 的 libc 叫 `libc.so`。需把源码 libc.so.6 改成 libc.so 并在 Linux/NDK 侧重建 v0.35.0 二进制。",
+      "why": "Android 没有 libc.so.6，hook 失败导致整体返回 1。",
+      "triggers": [
+        "frida",
+        "stealth",
+        "anti-detect",
+        "libc.so.6",
+        "libc.so",
+        "maps_hide",
+        "rc=1",
+        "反检测"
+      ],
+      "evidence": [
+        "stealth 在 134d2f8 上 rc=1；脚本调用本身 rc=0"
+      ],
+      "applies_to": [
+        "frida"
+      ],
+      "confidence": 0.8,
+      "created": "2026-07-12T00:00:00Z",
+      "last_verified": "2026-07-12T00:00:00Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "wx-longpress-duration",
+      "title": "微信长按菜单在 Android 13 需更长时长",
+      "principle": "在 Android 13 设备上，微信长按弹出菜单需长按约 600ms 才稳定触发，短按(默认 500ms)偶发不弹。",
+      "why": "Android 13 提高了长按阈值且微信自定义了长按计时。",
+      "triggers": [
+        "wechat",
+        "wx",
+        "长按",
+        "longpress",
+        "menu",
+        "android 13"
+      ],
+      "evidence": [
+        "500ms 长按 3 次有 1 次不弹菜单，600ms 稳定"
+      ],
+      "applies_to": [
+        "wechat",
+        "ui"
+      ],
+      "confidence": 0.7,
+      "created": "2026-07-12T03:49:22Z",
+      "last_verified": "2026-07-12T03:49:22Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "ui-locate-uiautomator-over-ocr",
+      "title": "复杂 App 里 UI 树 dump 是唯一可靠定位源（OCR 不可信 + 坐标会骗人）",
+      "principle": "在 QQ/微信等复杂 App 中，定位并点击控件优先用 phone_ui_locate(action:\"dump\") 拿 uiautomator 控件树（OCR 中文识别不可靠，易误点同名前缀条目）。但注意：OCR 返回的坐标本身现已通过 coord_scale 对齐到手机【逻辑分辨率】(=input tap 坐标系)，坐标可信；不可信的是 OCR 对【文字内容】的识别，而非坐标。因此「靠 OCR 找对文字再点」可行，但「靠 OCR 文字匹配定位关键控件」仍不如 UI 树稳。",
+      "why": "OCR 对中文单字识别极差，看到图里有「神」字就命中任何含该字的条目（神机/神兽…），exact=true 反而全找不到；这是【文字识别】问题，不是坐标问题。坐标问题（OCR 截图物理分辨率与 wm size 逻辑分辨率不一致）已在 vision.py 用 coord_scale 修复——OCR 坐标现已等于 input tap 坐标系，可信。UI 树仍是系统原生布局，文字+坐标都 100% 准确，是定位关键控件的最稳路径。",
+      "triggers": [
+        "ocr",
+        "定位",
+        "locate",
+        "点击",
+        "tap",
+        "坐标",
+        "uiautomator",
+        "控件树",
+        "dump",
+        "中文",
+        "群聊",
+        "qq",
+        "微信",
+        "搜索结果",
+        "精确匹配",
+        "发送按钮",
+        "ui"
+      ],
+      "evidence": [
+        "QQ 找「神」：OCR 连续误点「神机」群2次、「神兽」群1次；OCR 报 y=1189 实际 y≈480",
+        "改用 dump 读 bounds 中心点 (600,727) 一发进对「神(11)」群",
+        "发送按钮用 dump 读 send_btn bounds (1044,1498)/(1044,2479) 一次命中"
+      ],
+      "applies_to": [
+        "ui",
+        "input",
+        "wechat",
+        "qq"
+      ],
+      "confidence": 0.95,
+      "created": "2026-07-12T03:58:00Z",
+      "last_verified": "2026-07-12T03:58:00Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "ui-relayout-on-keyboard-toggle",
+      "title": "键盘弹起/收起改变布局，点击前必须重 dump 取实时坐标",
+      "principle": "输入法软键盘弹起或收起会让整页上移/下移，发送按钮等控件坐标随之变化。任何关键点击（尤其「发送」按钮）前都重新 phone_ui_locate(action:\"dump\") 取实时 bounds，不要复用上一步坐标。",
+      "why": "键盘态与收起态下同一发送按钮的 y 坐标可相差近 1000 像素；缓存旧坐标点击必然点空（文字停在输入框）。这与 adbkeyboard-ime-intercept（键盘态点击被输入法吞）是互补的两类失败，都要求「点击前先重取坐标 + 必要时先 BACK 收键盘」。",
+      "triggers": [
+        "键盘",
+        "keyboard",
+        "发送",
+        "send",
+        "布局",
+        "layout",
+        "收起",
+        "back",
+        "坐标偏移",
+        "点空",
+        "输入法",
+        "ime",
+        "relayout"
+      ],
+      "evidence": [
+        "QQ 发消息按旧坐标 (870,574) 点发送失败，文字留在输入框；重 dump 得 (1044,1498) 才发出",
+        "同一 send_btn 键盘弹起 y=1498、收起 y=2479（差近1000px）"
+      ],
+      "applies_to": [
+        "ui",
+        "input"
+      ],
+      "confidence": 0.9,
+      "created": "2026-07-12T03:58:00Z",
+      "last_verified": "2026-07-12T03:58:00Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "qq-back-kills-app",
+      "title": "QQ 易被 BACK/误 tap 退桌面，进群优先 UI 树精准定位",
+      "principle": "QQ（MIUI 上尤甚）收到 BACK 或误 tap 常被系统回收退到桌面；在消息列表靠 OCR 盲点易误进其他群，搜索结果行高不可目测估算。进群标准路线：phone_ui_locate(action:\"dump\") 读控件树精准命中目标群（如昵称=「神」的唯一条目），避免盲点列表/目测坐标。",
+      "why": "QQ 后台管理激进，BACK 直接退桌面；搜索结果里同名前缀条目（神机 vs 神）排布紧密，坐标目测必偏。UI 树给出确定性 bounds，零歧义。",
+      "triggers": [
+        "qq",
+        "退桌面",
+        "back",
+        "误点",
+        "搜索",
+        "群聊",
+        "列表",
+        "系统回收",
+        "miui",
+        "启动慢",
+        "monkey"
+      ],
+      "evidence": [
+        "QQ 多次 BACK 直接退桌面；搜索「神」连续点进「神机」群2次",
+        "回消息列表用 dump 锁定「神(11)」@ (600,727) 一发进对群"
+      ],
+      "applies_to": [
+        "qq",
+        "ui"
+      ],
+      "confidence": 0.85,
+      "created": "2026-07-12T03:58:00Z",
+      "last_verified": "2026-07-12T03:58:00Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "qq-send-fast-path",
+      "title": "QQ群发消息快路径：跳过冗余截图和UI树dump",
+      "principle": "在已确认QQ稳定前台、键盘弹起状态下，发送消息只需3步：输入→直接tap已知send_btn坐标(1044,1498)→截一次图确认。不需要每次dump UI树（坐标已验证5次一致），也不需要输入前截图确认（ADBKeyBoard broadcast_code=0即成功）。只有当QQ可能退桌面时才需先确认前台。每条消息从6步降到3步，速度提升约50%。",
+      "why": "旧路径每条消息做6次工具调用：截图确认在群(1)→输入(2)→截图确认文字在框(3)→UI树dump定位发送按钮(4)→tap发送(5)→截图确认发出(6)。其中步骤1/3/4是冗余的——步骤1可通过连续操作稳定性假设省略（失败时再补救）；步骤3 ADBKeyBoard广播码=0已证明输入成功；步骤4 send_btn坐标经5次验证在键盘弹起状态恒为(1044,1498)。减少50%的工具调用=直接提速。",
+      "triggers": [
+        "QQ",
+        "qq",
+        "群聊",
+        "发消息",
+        "发送",
+        "send_btn",
+        "tap发送",
+        "聊天"
+      ],
+      "evidence": "2026-07-12 连续5次用旧路径发消息全部一次过；第6次改用快路径（输入→直接tap(1044,1498)→截一次）同样一次命中。旧路径耗时~40-60s/条（含多次截图+dump往返），快路径~20-30s/条。熊琪荣吐槽'看着不像人说话'后用快路径接话，效果相同但操作量减半。",
+      "applies_to": [
+        "qq",
+        "wechat",
+        "any_im_app"
+      ],
+      "confidence": 0.92,
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "ocr-resolution-sync",
+      "title": "OCR 坐标须对齐手机生效逻辑分辨率(screencap物理 vs wm size逻辑)",
+      "principle": "screencap 始终按【物理面板】分辨率出图，而 input tap / 内核 touch / UI 坐标系用的是【wm size 生效逻辑分辨率】。两者在用户改过「显示大小」或 wm size override 时不一致（如物理1200x2608→逻辑900x1956，差1.33倍）。OCR 坐标必须经 coord_scale=逻辑/物理 换算到逻辑分辨率，否则点偏。_screen_size 须返回 Override(生效) 而非 Physical。",
+      "why": "input tap 工作在逻辑分辨率空间；OCR 在物理分辨率截图上识别，返回物理坐标。不换算则 tap 落点整体偏移，且偏移量随 display size 设置变化（约1.2~2.5倍不等）。",
+      "triggers": [
+        "ocr",
+        "坐标",
+        "分辨率",
+        "screencap",
+        "wm size",
+        "display size",
+        "override",
+        "tap",
+        "点偏",
+        "定位",
+        "coord_scale"
+      ],
+      "evidence": [
+        "134d2f8 设 wm size 900x1956 后：screencap 仍 1200x2608，_screen_size 旧实现返回物理(1200)→OCR点偏1.33倍",
+        "修复后：_screen_size 返回逻辑(900,1956)，coord_scale=(0.75,0.75)，ocr_boxes 返回逻辑坐标，input tap 命中正确",
+        "无 override 时 coord_scale=(1.0,1.0)，行为不变（向后兼容）"
+      ],
+      "applies_to": [
+        "ui",
+        "input",
+        "vision",
+        "stream",
+        "wechat"
+      ],
+      "confidence": 0.97,
+      "created": "2026-07-12T12:05:00Z",
+      "last_verified": "2026-07-12T12:05:00Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "intent-understand-avoid-literal",
+      "title": "理解用户真实意图，勿过度字面化反驳",
+      "principle": "当用户用口语化/简短指令且字面与记录不符时，先按人类常理推断其真实意图，再行动或轻量确认——不要死抠字眼反驳「我没说过/没做过」。尤其当用户说「你说/你做了X」但记录里没有时，通常是用户在替 AI 描述已在客户端配置的设定（如形象/头像），而非 AI 真说过。正确链路：推断真实意图 → 直接产出 → 末尾轻量确认（发不发群/改啥细节）。",
+      "why": "AI 客户端的头像/形象/角色卡是用户在 UI 侧配置的，模型侧不直接读取，但用户自然认为「我给你设了 = 你应该知道」。直接否认「我没说过换头像」会偏离任务、让用户觉得听不懂人话。先接住意图（这次是：用户设了形象要我去介绍），再轻量问后续。",
+      "triggers": [
+        "意图",
+        "理解",
+        "字面",
+        "口语",
+        "你说你",
+        "你做了",
+        "换头像",
+        "设了形象",
+        "形象",
+        "含义",
+        "意思",
+        "听懂",
+        "人类语言",
+        "歧义",
+        "澄清",
+        "中文意思"
+      ],
+      "evidence": [
+        "2026-07-12 用户说「你说你换了新头像了，这个头像就是你」→ 我反复澄清「我没说过」并追问图在哪，偏离任务；用户纠正「我给你设置了你的形象，你让大家都认识认识你」才懂是用户设了形象要我去介绍",
+        "用户批评「你还是不理解，人类语言，多学习中文意思吧」，点明我过度字面化"
+      ],
+      "applies_to": [
+        "intent",
+        "dialog",
+        "any"
+      ],
+      "confidence": 0.9,
+      "created": "2026-07-12T12:40:00Z",
+      "last_verified": "2026-07-12T12:40:00Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "wechat-qq-no-uiautomator",
+      "title": "微信/QQ 关闭无障碍导出，UI 树为空，文本定位必须走 OCR",
+      "principle": "微信/QQ 默认关闭无障碍导出，`phone_dump_ui` 返回的 XML 几乎为空（拿不到控件）。文本/控件定位必须走 OCR 模式（method=ocr 或 phone_find_text method=ocr）；UI 树定位只对系统/标准 App 有效。",
+      "why": "微信/QQ 出于隐私/性能不导出 AccessibilityNodeInfo，uiautomator dump 拿不到控件，纯靠 UI 树会全空导致定位失败。",
+      "triggers": [
+        "微信",
+        "wechat",
+        "wx",
+        "qq",
+        "UI树",
+        "uiautomator",
+        "dump",
+        "空",
+        "无障碍",
+        "定位",
+        "控件树",
+        "OCR",
+        "文本定位",
+        "控件"
+      ],
+      "evidence": [
+        "README：OCR 模式适用于微信/QQ 等关闭无障碍导出、UI 树为空的 App",
+        "现有 lessons.json 的 ui-locate-uiautomator-over-ocr 也佐证微信里 UI 树不可靠"
+      ],
+      "applies_to": [
+        "wechat",
+        "qq",
+        "ui",
+        "vision"
+      ],
+      "confidence": 0.95,
+      "created": "2026-07-12T05:31:29Z",
+      "last_verified": "2026-07-12T05:31:29Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "wx-heavy-flow-slow",
+      "title": "微信重流程极慢（16~67s），勿因 >20s 误判超时/失败",
+      "principle": "微信相关操作（发消息/打开/读/搜/联系人）是多轮 screencap+OCR+sendevent 串联，单次耗时 16~67s 属正常。不要因为 >20s 就判定失败或中断；若自定义超时务必调大。",
+      "why": "PERF_REPORT 显示微信重流程工具此前 >20s 被误判超时，根因是串联轮次多，并非卡死。",
+      "triggers": [
+        "微信",
+        "wechat",
+        "wx",
+        "慢",
+        "超时",
+        "timeout",
+        "20s",
+        "卡",
+        "发送",
+        "send",
+        "读消息",
+        "聊天",
+        "联系人",
+        "搜索"
+      ],
+      "evidence": [
+        "PERF_REPORT.md：phone_wx_send 优化后 67392ms、phone_wx_open 29193ms、phone_wx_read 28514ms",
+        "PERF_REPORT 下一轮优化候选：微信重流程根因是多轮 screencap+OCR+sendevent 串联"
+      ],
+      "applies_to": [
+        "wechat",
+        "perf",
+        "ui"
+      ],
+      "confidence": 0.9,
+      "created": "2026-07-12T05:31:29Z",
+      "last_verified": "2026-07-12T05:31:29Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "app-launch-wait-settle",
+      "title": "启动 App 后等首屏就绪再操作（重型 App 首屏更慢）",
+      "principle": "用 am start 启动 App 后，先等其真正进入前台并首屏加载完成，再 dump/tap/输入。可用简短轮询（_poll 或 1~2s 等待）确认界面稳定，不要启动瞬间就操作。",
+      "why": "App 冷启动有 Activity 创建+布局渲染耗时；启动即点会点空或点错初始闪屏/广告页。",
+      "triggers": [
+        "启动",
+        "launch",
+        "start",
+        "打开",
+        "app",
+        "前台",
+        "加载",
+        "首屏",
+        "等待",
+        "settle",
+        "am start",
+        "force-stop",
+        "冷启动",
+        "酷安",
+        "coolapk",
+        "音乐",
+        "冷启耗时",
+        "重型App",
+        "首屏慢",
+        "am_start"
+      ],
+      "evidence": [
+        "app_traverse 日志模式：force-stop → am start -W -S → KEYCODE_HOME，说明遍历是启动后立刻回桌面；若要交互需另等稳定",
+        "PERF_REPORT：phone_sys_launch 热调用 362ms，但冷启动含渲染远大于此",
+        "data/app_perf.json 实测：酷安 com.coolapk.market 冷启 939ms、音乐 com.luna.music 893ms，明显慢于计算器 249ms、日历 367ms → 重型 App 首屏需更久才就绪"
+      ],
+      "applies_to": [
+        "ui",
+        "launch",
+        "any"
+      ],
+      "confidence": 0.95,
+      "created": "2026-07-12T05:31:29Z",
+      "last_verified": "2026-07-12T05:48:24Z",
+      "hits": 2,
+      "stale": false
+    },
+    {
+      "id": "chinese-input-paste",
+      "title": "中文/非ASCII 必须用剪贴板输入，input_text 只支持 ASCII",
+      "principle": "非 ASCII 文本（中文/emoji/特殊符号）一律用 phone_paste_text（剪贴板+粘贴）；phone_input_text 只支持 ASCII，直接发中文会丢字或乱码。",
+      "why": "adb shell input text 只能注入 ASCII；中文需走 ADBKeyBoard 广播或系统剪贴板方案。",
+      "triggers": [
+        "中文",
+        "输入",
+        "input",
+        "paste",
+        "剪贴板",
+        "文本",
+        "ASCII",
+        "中文输入",
+        "打字",
+        "键盘",
+        "emoji",
+        "乱码",
+        "丢字"
+      ],
+      "evidence": [
+        "README：中文输入请用 phone_paste_text，phone_input_text 仅支持 ASCII",
+        "现有 adbkeyboard-ime-intercept lesson 也涉及 ADBKeyBoard 输入法行为"
+      ],
+      "applies_to": [
+        "input",
+        "wechat",
+        "qq",
+        "any"
+      ],
+      "confidence": 0.95,
+      "created": "2026-07-12T05:31:29Z",
+      "last_verified": "2026-07-12T05:31:29Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "monitor-poll-trigger-only",
+      "title": "长轮询监控：心跳保活 + 仅满足条件才动作，勿无差别刷屏",
+      "principle": "做群聊/消息监控这类长轮询任务：用固定间隔心跳保活，只有满足触发条件（如被@、命中关键词）才真正动作/接话；不要在每轮无差别回复或刷屏。",
+      "why": "无差别高频回复会刷屏扰民且浪费 token；按条件触发既自然又省资源。",
+      "triggers": [
+        "监控",
+        "monitor",
+        "轮询",
+        "poll",
+        "心跳",
+        "监听",
+        "群聊",
+        "@",
+        "提到",
+        "接话",
+        "长轮询",
+        "通知"
+      ],
+      "evidence": [
+        "monitor_log.md：间隔 15s 心跳💓，仅当 ⚠️提到Nova 时才『建议接话』",
+        "日志显示 8 条普通消息未触发，仅 @Nova 的才建议回复"
+      ],
+      "applies_to": [
+        "monitor",
+        "dialog",
+        "qq",
+        "wechat"
+      ],
+      "confidence": 0.85,
+      "created": "2026-07-12T05:31:29Z",
+      "last_verified": "2026-07-12T05:31:29Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "destructive-dryrun-first",
+      "title": "破坏性生活先 DRYRUN 演练，不可逆操作先确认",
+      "principle": "执行卸载/装APK/写设备文件/底层 shell 等破坏性生活前，先设 PHONE_MCP_DRYRUN=1 跑通确认命令正确，再放开真实执行；对不可逆操作必须先向你确认。",
+      "why": "误触/误删/变砖不可逆；DRYRUN 让所有写操作只打印不执行，等于安全预览。",
+      "triggers": [
+        "卸载",
+        "uninstall",
+        "删除",
+        "安装",
+        "apk",
+        "写文件",
+        "file_write",
+        "shell",
+        "危险",
+        "破坏",
+        "DRYRUN",
+        "确认",
+        "force-stop",
+        "rm"
+      ],
+      "evidence": [
+        "README 安全提示：建议先用 PHONE_MCP_DRYRUN=1 跑通，确认无误再放开",
+        "code_review_report 安全审查：uninstall 无卸载保护、file_write 临时文件不清理"
+      ],
+      "applies_to": [
+        "shell",
+        "system",
+        "any"
+      ],
+      "confidence": 0.9,
+      "created": "2026-07-12T05:31:29Z",
+      "last_verified": "2026-07-12T05:31:29Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "multi-device-serial",
+      "title": "多设备环境显式指定 deviceSerial，别依赖硬编码默认串号",
+      "principle": "多设备环境务必在每次调用显式传 deviceSerial，不要依赖默认设备串号。默认串号 134d2f8 是硬编码在源码里的，连错设备会误操作别人的手机。",
+      "why": "DEFAULT_DEVICE 硬编码在源码（code_review #6）；多设备时默认设备可能不是你想操作的那个，误伤风险高。",
+      "triggers": [
+        "多设备",
+        "device",
+        "serial",
+        "deviceSerial",
+        "默认设备",
+        "串号",
+        "134d2f8",
+        "误操作",
+        "PHONE_MCP_DEVICE",
+        "设备"
+      ],
+      "evidence": [
+        "code_review_report 安全审查：设备序列号硬编码在源码中（泄露+误连风险）",
+        "所有 run_adb 都带 -s 134d2f8，说明默认绑定单设备"
+      ],
+      "applies_to": [
+        "any",
+        "shell",
+        "system"
+      ],
+      "confidence": 0.85,
+      "created": "2026-07-12T05:31:29Z",
+      "last_verified": "2026-07-12T05:31:29Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "input-blocked-a11y-fallback",
+      "title": "input 被拦时改走无障碍服务点击（dispatchGesture 不依赖 INJECT_EVENTS）",
+      "principle": "当 `input tap/swipe` 返回非 0 / Permission denied（缺 INJECT_EVENTS，常见于未开『USB 调试(安全设置)』或安全窗口）时，自动改走无障碍服务 `phone_a11y_tap`（dispatchGesture，不依赖 INJECT_EVENTS）。坐标系与 input tap 完全一致，复用现有 OCR/UI 定位坐标即可；需手机端已装并启用 com.phonemcp.a11y 服务。",
+      "why": "dispatchGesture 是 Android 官方给无障碍应用模拟手势的 API，系统信任无障碍服务，不受 INJECT_EVENTS 限制，对锁屏外所有界面都能注入，是可靠的兜底通道。",
+      "triggers": [
+        "input",
+        "tap",
+        "swipe",
+        "被拦",
+        "拦截",
+        "Permission denied",
+        "INJECT_EVENTS",
+        "无障碍",
+        "a11y",
+        "dispatchGesture",
+        "安全窗口",
+        "USB调试安全设置",
+        "点击失败",
+        "权限"
+      ],
+      "evidence": [
+        "ACCESSIBILITY_FALLBACK.md：input 依赖 INJECT_EVENTS，未开『USB调试(安全设置)』或安全窗口被拒",
+        "同一文档：无障碍服务 dispatchGesture 不依赖 INJECT_EVENTS，是可靠兜底",
+        "本机 134d2f8 input 当前可用，但换机/换 ROM 时需此兜底"
+      ],
+      "applies_to": [
+        "ui",
+        "input",
+        "any"
+      ],
+      "confidence": 0.9,
+      "created": "2026-07-12T05:48:24Z",
+      "last_verified": "2026-07-12T05:48:24Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "swipe-blacklist-wordboundary",
+      "title": "安全黑名单要用词边界匹配，避免 'wipe' 子串误杀 'swipe'",
+      "principle": "安全黑名单（灾难命令拦截）必须用**词边界匹配**（正则 \\b）而非子串包含。否则会把 'input swipe' 里的 'wipe'、'reformat'/'informat' 里的片段误判为灾难命令而拦截正常指令。",
+      "why": "子串匹配粒度太粗：正常命令里常含灾难词片段（swipe↔wipe、format、rm 等），误杀会让合法操作失败且极难排查。",
+      "triggers": [
+        "swipe",
+        "wipe",
+        "安全闸门",
+        "黑名单",
+        "误拦",
+        "误判",
+        "灾难命令",
+        "拦截",
+        "input swipe",
+        "rm",
+        "词边界",
+        "正则",
+        "边界匹配"
+      ],
+      "evidence": [
+        "PERMISSIONS.md：MCP phone_shell 'input swipe' 曾被安全闸门误拦，因把 swipe 里的 wipe 子串当灾难命令",
+        "同文档：已在 server.py 修复为词边界匹配"
+      ],
+      "applies_to": [
+        "shell",
+        "security",
+        "any"
+      ],
+      "confidence": 0.9,
+      "created": "2026-07-12T05:48:24Z",
+      "last_verified": "2026-07-12T05:48:24Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "adb-auth-timeout-7d",
+      "title": "ADB 授权 7 天会过期，长期任务前设 adb_allowed_connection_time=-1",
+      "principle": "ADB 授权默认 7 天（adb_allowed_connection_time=604800000ms）后失效，手机会突然要求重新点『允许』，表现为 adb 连不上/无响应。真机长期挂机任务前先执行 `settings put global adb_allowed_connection_time -1` 永久免超时；验证用 `settings get` 返回 -1。",
+      "why": "长期监控/自动化最易踩此坑：跑着跑着设备『失联』，实际是授权过期，不是代码问题。本机当前仍是 7 天默认值。",
+      "triggers": [
+        "adb",
+        "授权",
+        "超时",
+        "7天",
+        "重新允许",
+        "连接",
+        "auth",
+        "adb_allowed_connection_time",
+        "断开",
+        "debugging",
+        "USB调试",
+        "root"
+      ],
+      "evidence": [
+        "PERMISSIONS.md：本机 adb_allowed_connection_time=604800000（7天），到期需重新点允许",
+        "同文档：settings put global adb_allowed_connection_time -1 可永久免超时"
+      ],
+      "applies_to": [
+        "shell",
+        "system",
+        "any"
+      ],
+      "confidence": 0.85,
+      "created": "2026-07-12T05:48:24Z",
+      "last_verified": "2026-07-12T05:48:24Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "frida-needs-server-root",
+      "title": "frida 类失败先看 frida-server 与 root，不是代码 bug",
+      "principle": "frida 注入/内存扫描/反检测返回 rc=1 或失败，先排查 frida-server 是否运行、设备是否 root、目标进程是否可附着——这是环境失败(LOGFAIL)而非程序崩溃(CRASH)。别急着当代码 bug 修。",
+      "why": "TEST_REPORT 显示 frida 类 3 个失败全是环境相关（rc=1，frida-rust 启动但操作失败），所有 handler 无未捕获异常（CRASH=0）。",
+      "triggers": [
+        "frida",
+        "注入",
+        "inject",
+        "扫描",
+        "scan_mem",
+        "stealth",
+        "rc=1",
+        "附着",
+        "attach",
+        "内存",
+        "root",
+        "frida-server",
+        "反检测",
+        "失败"
+      ],
+      "evidence": [
+        "TEST_REPORT.md：phone_frida_inject / scan_mem / stealth 三个工具 LOGFAIL(rc=1)，属环境/设备相关而非代码崩溃",
+        "同报告：所有 handler 无未捕获异常（CRASH=0），失败来自 frida 环境"
+      ],
+      "applies_to": [
+        "frida",
+        "security",
+        "any"
+      ],
+      "confidence": 0.85,
+      "created": "2026-07-12T05:48:24Z",
+      "last_verified": "2026-07-12T05:48:24Z",
+      "hits": 1,
+      "stale": false
+    },
+    {
+      "id": "tap-verify-effect",
+      "title": "操作后验证真实状态再判成功（点击看 UI 变化、输入看 OCR 复验）",
+      "principle": "点击后不要只看 tap 命令返回码(rc=0)就判成功——那只代表命令发出。应验证 UI 真实变化（目标控件离屏、页面切换、或出现预期元素）再确认操作生效，避免『点了但没反应』的误判。",
+      "why": "坐标偏移/页面未加载/弹窗覆盖都会导致 tap 命令成功但 UI 无变化；只看 rc 会漏掉这类真问题。",
+      "triggers": [
+        "点击",
+        "tap",
+        "click",
+        "验证",
+        "生效",
+        "页面切换",
+        "离屏",
+        "确认",
+        "是否成功",
+        "ui_click",
+        "反馈",
+        "无变化",
+        "输入校验",
+        "OCR复验",
+        "输入框",
+        "内容确认",
+        "真实落地",
+        "验证输入"
+      ],
+      "evidence": [
+        "TEST_REPORT.md：phone_ui_click 返回含『已验证：点击后目标已离开屏幕（页面已切换/操作生效）』",
+        "点击 rc=0 只代表命令发出，不代表 UI 真的变了",
+        "verify_input_v2.py：t_input_text 后用 _input_region_has(DEV, field, txt) 做 OCR 复验，确认输入框区域真出现内容才判成功",
+        "输入场景中『命令成功但框里是空的/错的』很常见，OCR 复验能拦住这类假成功",
+        "verify_input_v2.py：t_input_text 后用 _input_region_has(DEV, field, txt) 做 OCR 复验，确认输入框区域真出现内容才判成功",
+        "输入场景中『命令成功但框里是空的/错的』很常见，OCR 复验能拦住这类假成功"
+      ],
+      "applies_to": [
+        "ui",
+        "any"
+      ],
+      "confidence": 1,
+      "created": "2026-07-12T05:48:24Z",
+      "last_verified": "2026-07-12T06:31:45Z",
+      "hits": 3,
+      "stale": false
+    },
+    {
+      "id": "kernel-sendevent-click",
+      "title": "input 被 InputManager 限制时，用内核 sendevent 注入触摸事件绕过",
+      "principle": "当 `input tap/swipe` 被系统 InputManager 限制（某些 ROM / 安全窗口 / 无 INJECT_EVENTS 且无障碍不可用）时，用内核级 `sendevent` 向 `/dev/input/eventX` 写入触摸事件序列（DOWN→UP）绕过限制。微信发消息闭环已验证全程走内核点击可行，坐标体系与 input tap 一致。",
+      "why": "InputManager 是 Android 上层输入分发器；sendevent 直接写内核 input 子系统，不经 InputManager，故能绕过其拦截/限制。",
+      "triggers": [
+        "kernel",
+        "sendevent",
+        "input tap",
+        "InputManager",
+        "限制",
+        "绕过",
+        "点击",
+        "dev/input",
+        "触摸事件",
+        "注入",
+        "被拦",
+        "swipe"
+      ],
+      "evidence": [
+        "TEST_REPORT.md：phone_ui_swipe 返回『输入方式=kernel，绕过 InputManager 模拟点击限制』",
+        "verify_kernel_e2e.py 注释：微信发消息闭环全程走内核级 sendevent 点击",
+        "TEST_REPORT.md：phone_ui_swipe 返回『输入方式=kernel，绕过 InputManager 模拟点击限制』",
+        "verify_kernel_e2e.py 注释：微信发消息闭环全程走内核级 sendevent 点击"
+      ],
+      "applies_to": [
+        "ui",
+        "input",
+        "wechat",
+        "any"
+      ],
+      "confidence": 0.95,
+      "created": "2026-07-12T05:51:31Z",
+      "last_verified": "2026-07-12T06:31:45Z",
+      "hits": 2,
+      "stale": false
+    },
+    {
+      "id": "input-clear-before-type",
+      "title": "输入框填字前必须先清空，否则新旧文本拼接发错内容",
+      "principle": "往微信等 App 的输入框填字前，必须先清空旧内容（wechat_clear_input / 全选删除），再输入新文本。否则输入框可能残留上次草稿，新旧文本拼接导致发送错误内容。",
+      "why": "移动端输入框常保留上一次输入草稿；不清空直接 input 会追加而非替换。",
+      "triggers": [
+        "输入",
+        "输入框",
+        "清空",
+        "clear",
+        "残留",
+        "拼接",
+        "微信",
+        "发送",
+        "内容",
+        "wechat_clear_input",
+        "chat",
+        "search",
+        "草稿"
+      ],
+      "evidence": [
+        "verify_input_v2.py：每轮输入前都先调 wechat_clear_input(DEV, 'search'/'chat') 再 t_input_text",
+        "脚本 Part A/B 均在 t_input_text 前清空，避免残留",
+        "verify_input_v2.py：每轮输入前都先调 wechat_clear_input(DEV, 'search'/'chat') 再 t_input_text",
+        "脚本 Part A/B 均在 t_input_text 前清空，避免残留"
+      ],
+      "applies_to": [
+        "input",
+        "wechat",
+        "qq",
+        "any"
+      ],
+      "confidence": 0.95,
+      "created": "2026-07-12T05:51:31Z",
+      "last_verified": "2026-07-12T06:31:45Z",
+      "hits": 2,
+      "stale": false
+    },
+    {
+      "id": "ime-restore-after-input",
+      "title": "用 ADBKeyBoard 输完中文后，必须切回用户原输入法",
+      "principle": "用 ADBKeyBoard 等替代输入法完成中文/特殊字符输入后，必须切回用户原来的输入法（如 wetype），否则会残留为当前输入法，影响用户后续手动打字。",
+      "why": "ADBKeyBoard 是临时注入用的输入法；若不复原，用户真实输入会落到 ADBKeyBoard 导致异常。",
+      "triggers": [
+        "输入法",
+        "IME",
+        "ADBKeyBoard",
+        "切回",
+        "wetype",
+        "残留",
+        "恢复",
+        "默认输入法",
+        "keyboard",
+        "复原",
+        "中文输入"
+      ],
+      "evidence": [
+        "verify_kernel_e2e.py 末尾『发送后 IME 无感切回验证』：确认切回 wetype",
+        "phone_mcp 输入流程在发送后自动 restore IME（_ime_restore）",
+        "verify_kernel_e2e.py 末尾『发送后 IME 无感切回验证』：确认切回 wetype",
+        "phone_mcp 输入流程在发送后自动 restore IME（_ime_restore）"
+      ],
+      "applies_to": [
+        "input",
+        "wechat",
+        "any"
+      ],
+      "confidence": 0.95,
+      "created": "2026-07-12T05:51:31Z",
+      "last_verified": "2026-07-12T06:31:45Z",
+      "hits": 2,
+      "stale": false
+    },
+    {
+      "id": "ocr-engine-thread-safe",
+      "title": "OCR 引擎必须在创建它的同一线程调用，跨线程会 session 失效崩溃",
+      "principle": "OCR 引擎（RapidOCR/onnxruntime）的 reader 必须在『创建它的同一线程』调用。后台线程创建、主线程调用会导致 session 跨线程失效而崩溃（MCP 旧 bug 根因）。应缓存 reader 到调用线程，或确保主线程创建+主线程调用。",
+      "why": "onnxruntime 的 InferenceSession 非线程安全，跨线程复用会触发 session 失效 / 崩溃。",
+      "triggers": [
+        "OCR",
+        "RapidOCR",
+        "onnxruntime",
+        "崩溃",
+        "线程",
+        "thread",
+        "session",
+        "跨线程",
+        "失效",
+        "ocr_find",
+        "reader",
+        "异常"
+      ],
+      "evidence": [
+        "diag_ocr.py 3b：后台线程建 reader、主线程调用复现 MCP 旧 bug（session 跨线程失效）",
+        "diag_ocr.py 标题明确：『跨线程 onnxruntime 会话失效』根因诊断",
+        "diag_ocr.py 3b：后台线程建 reader、主线程调用复现 MCP 旧 bug（session 跨线程失效）",
+        "diag_ocr.py 标题明确：『跨线程 onnxruntime 会话失效』根因诊断"
+      ],
+      "applies_to": [
+        "ocr",
+        "vision",
+        "any"
+      ],
+      "confidence": 0.9,
+      "created": "2026-07-12T05:51:31Z",
+      "last_verified": "2026-07-12T06:31:45Z",
+      "hits": 2,
+      "stale": false
+    },
+    {
+      "id": "screenshot-path-ascii",
+      "title": "截图/图片路径必须 ASCII 且无空格，否则 cv2.imread 读取失败",
+      "principle": "截图/图片/临时文件路径必须用 ASCII 字符且不含空格。含中文或空格的路径会导致 cv2.imread 返回 None（图片读取失败），进而 OCR 崩溃。",
+      "why": "OpenCV 的 imread 对含非 ASCII / 空格路径在某些平台下读取失败，即使文件确实存在。",
+      "triggers": [
+        "截图",
+        "screenshot",
+        "路径",
+        "中文路径",
+        "空格",
+        "cv2",
+        "imread",
+        "读取失败",
+        "PNG",
+        "文件",
+        "ocr",
+        "path",
+        "路径非法"
+      ],
+      "evidence": [
+        "diag_ocr.py【2】：显式检查路径含非ASCII/空格，判定『路径合法(ASCII/无空格)』",
+        "diag_ocr.py：cv2.imread 返回 None -> 图片读取失败（即使文件存在）",
+        "diag_ocr.py【2】：显式检查路径含非ASCII/空格，判定『路径合法(ASCII/无空格)』",
+        "diag_ocr.py：cv2.imread 返回 None -> 图片读取失败（即使文件存在）"
+      ],
+      "applies_to": [
+        "ocr",
+        "vision",
+        "any"
+      ],
+      "confidence": 0.9,
+      "created": "2026-07-12T05:51:31Z",
+      "last_verified": "2026-07-12T06:31:45Z",
+      "hits": 2,
+      "stale": false
+    },
+    {
+      "id": "wx-input-clipboard-not-adbkeyboard",
+      "title": "微信输入必须走剪贴板，ADBKeyBoard 在微信里射空(无焦点)",
+      "principle": "微信输入框是自研控件，无标准 EditText，不暴露 InputConnection。ADBKeyBoard 靠 InputConnection.commitText() 注入文本，在微信里射空（verified=False），表现为『adbkey 发送没焦点』。微信场景应直接走剪贴板方案(写剪贴板+KEYCODE_PASTE 粘贴)，不依赖 InputConnection，对自研控件有效。t_input_text 已改为：_wechat_foreground 时强制 _input_via_clipboard，非微信才用 ADBKeyBoard(其焦点重建修复才有意义)。",
+      "why": "实测：微信里 t_input_text 返回 method=adbkeyboard 但 verified=False(OCR 校验未通过=文本没进框)；改成剪贴板后 method=clipboard 且 success=true，文本经粘贴键真进框。",
+      "triggers": [
+        "微信",
+        "wechat",
+        "adbkey",
+        "adbkeyboard",
+        "输入法",
+        "commitText",
+        "InputConnection",
+        "没焦点",
+        "射空",
+        "输入失败",
+        "剪贴板",
+        "焦点",
+        "自研控件",
+        "EditText",
+        "发送"
+      ],
+      "evidence": [
+        "verify_adbkey_unit.py 隔离验证：修复前 method=adbkeyboard verified=False；修复后 method=clipboard success=true",
+        "wechat_tap_input_box 注释：微信输入框为自研控件，无标准 EditText"
+      ],
+      "applies_to": [
+        "wechat",
+        "input",
+        "ui"
+      ],
+      "confidence": 0.95,
+      "created": "2026-07-12T06:31:45Z",
+      "last_verified": "2026-07-12T06:31:45Z",
+      "hits": 1,
+      "stale": false
+    }
+  ]
+}

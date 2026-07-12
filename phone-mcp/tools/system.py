@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """系统操作工具：shell、进程、属性、文件、安装/卸载、内核进程、微信数据库。"""
-import os, re, shlex, subprocess, hashlib
+import os, re, shlex, subprocess, hashlib, time
 
 from adb import run_adb, log, resolve_device, require_shell, forbid_catastrophic, list_devices
 from utils import ok, fail, text_block
-from tools._shared import SHOT_DIR
+from tools._shared import SHOT_DIR, _req
+
+# 解析当前前台应用（包名 + Activity），用于 get_current_app
+_FOCUS_RE = re.compile(r"mCurrentFocus=Window\{[^}]*?\b([\w.\-/$]+)/([\w.\-/$]+)")
+_FOCUSED_APP_RE = re.compile(r"mFocusedApp=AppWindowToken\{[^}]*?\b([\w.\-/$]+)/([\w.\-/$]+)")
 def t_shell(args):
     require_shell()
     device = resolve_device(args.get("deviceSerial"))
@@ -55,7 +59,9 @@ def t_force_stop(args):
     run_adb(["shell", "am", "force-stop", pkg], device=device, mutating=True)
     return [text_block("已强制停止 %s。" % pkg)]
 def t_get_current_app(args):
-    """返回当前前台应用包名与 Activity（dumpsys window 解析 mCurrentFocus/mFocusedApp）。只读。"""
+    """返回当前前台应用包名与 Activity。
+    依次尝试：mCurrentFocus / mFocusedApp / mResumedActivity（兜底，覆盖更多 ROM/版本）。
+    只读。"""
     device = resolve_device(args.get("deviceSerial"))
     try:
         r = run_adb(["shell", "dumpsys", "window"], device=device,
@@ -64,11 +70,21 @@ def t_get_current_app(args):
     except Exception as e:
         return fail("获取当前应用失败: %s" % e)
     m = _FOCUS_RE.search(out) or _FOCUSED_APP_RE.search(out)
-    if not m:
-        return fail("未能解析当前前台应用（可能无前台界面或 dumpsys 无输出）。")
-    pkg, act = m.group(1), m.group(2)
-    return ok("当前前台应用：\n  包名(package): %s\n  Activity: %s" % (pkg, act),
-              package=pkg, activity=act)
+    if m:
+        pkg, act = m.group(1), m.group(2)
+        return ok("当前前台应用：\n  包名(package): %s\n  Activity: %s" % (pkg, act),
+                  package=pkg, activity=act)
+    # 兜底：mResumedActivity（_foreground_activity 已验证在 Android 16 上可用）
+    try:
+        fg = _foreground_activity(device)
+        if fg.get("package"):
+            return ok("当前前台应用：\n  包名(package): %s\n  Activity: %s"
+                      % (fg.get("package"), fg.get("activity")),
+                      package=fg.get("package"), activity=fg.get("activity"),
+                      via="mResumedActivity")
+    except Exception:
+        pass
+    return fail("未能解析当前前台应用（可能无前台界面或 dumpsys 无输出）。")
 
 def t_kill_process(args):
     """结束进程。type="pid" 用 kill；否则用 force-stop。"""
@@ -348,60 +364,46 @@ def t_wechat_db_decrypt(args):
     except Exception as e:
         return fail("解密失败(密钥错误或无法打开): %s" % e)
 
-def t_input_text(args):
-    """【统一中文/任意文本输入】自动选择最优输入方式（对齐 open-mobile-mcp / wechat-mcp-server 行业标准）：
-      - 优先 ADBKeyBoard（ADB 输入法 + 广播注入）：支持中文/英文/emoji/特殊符号/多行换行，
-        且输入法无感知切换（输入前记录用户原输入法→切到 ADBKeyBoard→广播提交→切回原输入法）；
-        首次使用自动从本地 ADBKeyboard.apk 安装并启用。
-      - ADBKeyBoard 不可用/异常 → 自动降级剪贴板(cmd/service call + 粘贴键)，
-        保留 service call 剪贴板方案作为兜底，确保中文始终可输入。
-    微信(com.tencent.mm)场景自动判定 search/chat 区域；非微信聚焦首个 EditText。
-    返回结构化信封，data.method 标注实际输入方式('adbkeyboard'|'clipboard')，
-    data.verified 标注 OCR 校验结果（微信场景）。"""
-    text = _req(args, "text")
-    device = resolve_device(args.get("deviceSerial"))
-    field = (args.get("field") or "auto")
-    if field == "auto":
-        # 仅在真正处于搜索页(顶部出现「搜索」占位符)时按搜索框处理，避免把聊天页误判为搜索页
-        field = "search" if _ocr_sees(device, "搜索", region=[0, 0.0, 1, 0.22]) else "chat"
-    # 1) 优先 ADBKeyBoard（首次使用自动安装并启用）
-    ak_err = None
-    if _adbkeyboard_install(device):
-        try:
-            verified, info = _input_via_adbkeyboard(device, text, field)
-            vlabel = ("通过" if verified is True
-                      else ("未确认(内容应已写入)" if verified is None else "未通过"))
-            return ok("已通过 ADBKeyBoard 输入法输入文本(输入方案=adbkeyboard, OCR校验=%s): %s"
-                      % (vlabel, text),
-                      text=text, method="adbkeyboard", verified=verified, field=field,
-                      adbkeyboard_info=info)
-        except Exception as e:
-            ak_err = "%s: %s" % (type(e).__name__, e)
-            _ocr_debug("ADBKeyBoard 输入失败，降级剪贴板: %s" % ak_err)
-    else:
-        ak_err = "ADBKeyBoard 不可用(未安装/未启用)"
-    # 2) 兜底：剪贴板方案（附上 ADBKeyBoard 失败原因，便于排查）
-    try:
-        res = _input_via_clipboard(device, text, field)
-        if ak_err and isinstance(res, dict):
-            res.setdefault("data", {})
-            res["data"]["adbkeyboard_error"] = ak_err
-        return res
-    except Exception as e:
-        return fail("文本输入失败（ADBKeyBoard 与剪贴板均不可用）：%r" % e, text=text,
-                    adbkeyboard_error=ak_err)
+
+# ===========================================================================
+# 统一入口：合并 get/set 对等工具
+# ===========================================================================
+
+def t_prop(args):
+    """统一系统属性操作：action='get' 读取 / 'set' 写入。"""
+    action = args.get("action", "get")
+    if action == "set":
+        return t_setprop(args)
+    return t_getprop(args)
 
 
-def t_setup_adbkeyboard(args):
-    """安装并启用 ADBKeyBoard 输入法，返回输入法状态，供显式预置与排障。
-    若本地 ADBKeyboard.apk 缺失，会提示放入路径（不影响 phone_input_text 的剪贴板兜底）。"""
-    device = resolve_device(args.get("deviceSerial"))
-    installed = _adbkeyboard_install(device)
-    cur = _ime_current(device)
-    enabled = _ime_enabled_list(device)
-    return ok("ADBKeyBoard 安装/启用结果: %s" % ("成功" if installed else "失败(APK缺失或安装出错)"),
-              installed=installed,
-              current_ime=cur,
-              adbkeyboard_enabled=(ADB_KEYBOARD_IME in enabled),
-              apk_present=os.path.exists(ADB_KEYBOARD_APK),
-              apk_path=ADB_KEYBOARD_APK)
+def t_settings(args):
+    """统一 Settings 操作：action='get' 读取 / 'put' 写入。"""
+    action = args.get("action", "get")
+    if action == "put":
+        return t_settings_put(args)
+    return t_settings_get(args)
+
+
+def t_file(args):
+    """统一设备文件操作：action='read' 读取 / 'write' 写入。"""
+    action = args.get("action", "read")
+    if action == "write":
+        return t_file_write(args)
+    return t_file_read(args)
+
+
+def t_package(args):
+    """统一应用包管理：action='install' 安装本地 APK / 'uninstall' 卸载。"""
+    action = args.get("action", "install")
+    if action == "uninstall":
+        return t_uninstall(args)
+    return t_install_apk(args)
+
+
+def t_wechat_db(args):
+    """统一微信数据库操作：action='pull' 拉取加密 DB / 'decrypt' 尝试解密。"""
+    action = args.get("action", "pull")
+    if action == "decrypt":
+        return t_wechat_db_decrypt(args)
+    return t_wechat_db_pull(args)
